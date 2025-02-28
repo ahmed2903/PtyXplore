@@ -21,12 +21,13 @@ class load_data:
     
     def __init__(self, directory , scan_num, 
                  
-                 det_psize, det_distance, centre_pixel, wavelength):
+                 det_psize, det_distance, centre_pixel, wavelength, slow_axis):
         
         self.det_psize = det_psize
         self.det_psize = det_distance
         self.centre_pixel = centre_pixel
         self.wavelength = wavelength 
+        self.slow_axis = slow_axis
         
         self.dir = directory
         self.scan_num = scan_num
