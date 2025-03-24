@@ -2,6 +2,8 @@
 
 import numpy as np
 from scipy.optimize import minimize
+from scipy.spatial import KDTree
+from sklearn.decomposition import PCA
 
 def rotation_matrix(alpha, beta, gamma):
     # Construct rotation matrix using standard formulas
@@ -128,6 +130,8 @@ def reverse_kins_to_pixels(kins, pixel_size, detector_distance, central_pixel):
     y_pixel_indices = np.floor(y_pixels).astype(int)
 
     coord = np.vstack((x_pixel_indices, y_pixel_indices)).T
+
+    return coord
     
 def compute_vectors(coordinates, detector_distance, pixel_size, central_pixel, wavelength):
     """
@@ -168,3 +172,101 @@ def compute_vectors(coordinates, detector_distance, pixel_size, central_pixel, w
     ks = k*unit_vectors
 
     return ks
+
+def extract_streak_region(kins, percentage=10, start_position='random', start_idx=None, seed=42):
+    np.random.seed(seed)  # Seed for reproducibility
+    kins = np.asarray(kins)
+
+    if kins.ndim != 2 or kins.shape[1] < 2:
+        raise ValueError(f"Expected kins to be (N, 2+) but got {kins.shape}")
+
+    kins = kins[:, :2]
+    num_pixels = len(kins)
+    num_to_select = max(1, int(num_pixels * (percentage / 100)))
+
+    # Determine starting index
+    if start_idx is None:
+        sorted_indices = np.argsort(kins[:, 0] + kins[:, 1])  # Sort by sum(x, y)
+
+        if start_position == 'lowest':
+            start_idx = sorted_indices[0]
+        elif start_position == 'highest':
+            start_idx = sorted_indices[-1]
+        elif start_position == 'middle':
+            start_idx = sorted_indices[len(sorted_indices) // 2]
+        elif start_position == 'random':
+            start_idx = np.random.choice(num_pixels)
+        else:
+            raise ValueError("start_position must be 'lowest', 'highest', 'middle', or 'random'")
+
+    # Use KDTree for efficient nearest-neighbor search
+    tree = KDTree(kins)
+    selected_mask = np.zeros(num_pixels, dtype=bool)
+    selected_mask[start_idx] = True
+
+    # Initialize BFS queue
+    selected_points = [start_idx]
+    
+    while len(selected_points) < num_to_select:
+        new_candidates = []
+        for idx in selected_points:
+            # Find nearest neighbors (restrict search to small neighborhood)
+            _, neighbors = tree.query(kins[idx], k=min(10, num_pixels))  
+            for n_idx in neighbors:
+                if not selected_mask[n_idx]:  # Only add unselected points
+                    selected_mask[n_idx] = True
+                    new_candidates.append(n_idx)
+                    if len(selected_points) + len(new_candidates) >= num_to_select:
+                        break
+            if len(selected_points) + len(new_candidates) >= num_to_select:
+                break
+
+        selected_points.extend(new_candidates)
+
+    return selected_mask
+
+def extract_parallel_line(kins, width=1, position='center', offset=0):
+    """
+    Extracts a parallel thin line (1-2 pixels wide) from a streak in the kin coordinates.
+
+    Args:
+        kins (np.ndarray): (N, 2) array of kins coordinates.
+        width (int): Thickness of the extracted line (1 or 2 pixels).
+        position (str): Where to extract the line from. Options: ['center', 'top', 'bottom'].
+        offset (int): Custom offset from the center (in pixels).
+
+    Returns:
+        np.ndarray: A boolean mask for selected pixels.
+    """
+
+    kins = np.asarray(kins)
+    if kins.ndim != 2 or kins.shape[1] != 2:
+        raise ValueError(f"Expected kins to be (N, 2), but got {kins.shape}")
+
+    # Compute principal component (streak direction)
+    pca = PCA(n_components=2)
+    pca.fit(kins)
+    direction = pca.components_[0]  
+
+    kins_centered = kins - np.mean(kins, axis=0)  
+    projected_dist = np.dot(kins_centered, direction)  # Projection onto principal axis
+
+    perpendicular_vec = np.array([-direction[1], direction[0]])  
+    perp_dist = np.dot(kins_centered, perpendicular_vec) 
+
+    if position == 'center':
+        lower_bound = -width / 2
+        upper_bound = width / 2
+    elif position == 'top':
+        lower_bound = 2  
+        upper_bound = 2 + width
+    elif position == 'bottom':
+        lower_bound = -2 - width
+        upper_bound = -2
+    else:
+        lower_bound = offset
+        upper_bound = offset + width
+
+    selected_mask = (perp_dist >= lower_bound) & (perp_dist <= upper_bound)
+
+    return selected_mask

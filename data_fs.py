@@ -20,8 +20,6 @@ import cv2
 
 import scipy
 import scipy.fft
-from . import xrays_fs as xf
-from . import general_fs as gf
 from .utils import time_it
 
 ################# Load Data #################
@@ -424,7 +422,7 @@ def make_2dimensions_even(array_list):
         
     padded_arrays = Parallel(n_jobs=4)(delayed(process_array)(arr) for arr in array_list)
     
-    return padded_arrays
+    return np.array(padded_arrays)
 
 @time_it
 def filter_images(images, coords, variance_threshold, kin_coords=None, **kwargs):
@@ -519,12 +517,13 @@ def align_images(image_list):
     ref_img = image_list[0]  # Use first image as reference
     aligned_images.append(ref_img)
     
-    for img in image_list:
+    for img in image_list[1:]:
         avg = np.mean(np.array(aligned_images), axis = 0)    
         shift = phase_correlation(avg, img)  # Find shift
         aligned_img = scipy.ndimage.shift(img, shift, mode='constant')  # Apply shift
         aligned_images.append(aligned_img)
-    
+
+    aligned_images = np.array(aligned_images)
     return aligned_images
 
 
@@ -538,6 +537,7 @@ def remove_background(image, sigma=20):
 def remove_background_parallel(image_list, sigma=20, n_jobs = 8):
     """Applies background removal to all images in a list using multiprocessing."""
     result = Parallel(n_jobs=n_jobs)(delayed(remove_background)(im, sigma) for im in image_list)
+    result = np.array(result)
     return result
     
 def upsample_image(im, zoom_factor):
@@ -588,7 +588,7 @@ def detect_object(image, threshold_factor=0.5):
 def detect_obj_parallel(image_list, threshold=.1, n_jobs = 8):
     """Applies background removal to all images in a list using multiprocessing."""
     result = Parallel(n_jobs=n_jobs)(delayed(detect_object)(im, threshold) for im in image_list)
-    return result
+    return np.array(result)
 
 
 from scipy.ndimage import uniform_filter
@@ -651,6 +651,7 @@ def median_filter_parallel(images, kernel_size, stride, threshold, n_jobs=32):
     filtered_images = Parallel(n_jobs=n_jobs)(
         delayed(median_filter)(image, kernel_size, stride, threshold) for image in images
     )
+    filtered_images = np.array(filtered_images)
 
     return filtered_images
 
@@ -804,7 +805,7 @@ def apply_gaussian_blur(arrays, sigma=1):
     list of numpy arrays: The blurred objects.
     """
     blurred_objects = [gaussian_filter(arr, sigma=sigma) for arr in arrays]
-    return blurred_objects
+    return np.array(blurred_objects)
 
 def compute_histograms(image_list, bins=256):
     """
@@ -870,7 +871,9 @@ def bilateral_filter_parallel(image_list, sigma_spatial=3, sigma_range=50, kerne
 
     # Use joblib to parallelize the median filter application
     padded_images = Parallel(n_jobs=n_jobs)(
-        delayed(pad_to_double)(image, sigma_spatial,sigma_range,kernel_size) for image in image_list)
+        delayed(bilateral_filter)(image, sigma_spatial,sigma_range,kernel_size) for image in image_list)
+    
+    padded_images = np.array(padded_images)
     return padded_images
 @time_it
 def reorder_pixels_from_center(pixel_coords, connected_array=None):
@@ -899,11 +902,7 @@ def reorder_pixels_from_center(pixel_coords, connected_array=None):
 
     # Sort pixels by increasing distance
     sorted_indices = np.argsort(distances_from_center)
-    ordered_pixels = pixel_coords[sorted_indices]
-
-    if connected_array is not None:
-        ordered_array = connected_array[sorted_indices]
-
-        return ordered_pixels.tolist(), ordered_array
-        
-    return ordered_pixels.tolist()
+    # Ensure sorted_indices is a NumPy array and not a tuple
+    sorted_indices = np.array(sorted_indices, dtype=int)
+    
+    return sorted_indices

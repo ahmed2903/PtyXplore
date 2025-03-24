@@ -1,8 +1,10 @@
 import matplotlib.pyplot as plt
 import numpy as np 
-from utils import time_it
+from .utils import time_it
 from PIL import Image 
 import matplotlib.patches as patches
+from IPython.display import display
+import ipywidgets as widgets
 
 def plot_roi_from_numpy(array, roi=None, name=None, vmin=None, vmax=None, save = False, **kwargs):
 
@@ -211,10 +213,108 @@ def plot_map_on_detector(detec_image, k_map, vmin, vmax, title, cmap, crop=False
         rect = patches.Rectangle((rect_x, rect_y), rec_size, rec_size, linewidth=2, edgecolor=color, facecolor=color)
         ax.add_patch(rect)
 
-    ax.imshow(detec_image, cmap=cmap,  vmin=vmin, vmax=vmax, origin = 'lower')
+    im = ax.imshow(detec_image, cmap=cmap,  vmin=vmin, vmax=vmax, origin = 'lower')
+    fig.colorbar(im, orientation='vertical')
     plt.title(title)
     if 'fname' in kwargs:
         name = kwargs['fname']
         plt.savefig(name)
     
     plt.show()
+
+
+def two_lists_one_slider(img_list1, img_list2, scale_fac=0.3, vmin1 = None, vmax1 = None, vmin2=None, vmax2=None, cmap1 = 'viridis', cmap2 = 'viridis'):
+    """Displays a list of coherent images and allows scrolling through them via a slider."""
+    
+
+    num_images = len(img_list1)  # Number of images in the list
+    
+    # Create a slider for selecting the image index
+    img_slider = widgets.IntSlider(min=0, max=num_images - 1, value=0, description="Image")
+
+    # Create figure & axis once
+    fig, axes = plt.subplots(1,2, figsize=(10, 5))
+    
+    # Initial image
+    im1 = axes[0].imshow(img_list1[0], vmin = vmin1, vmax = vmax1, cmap=cmap1)    
+    axes[0].set_title(f"Image 1 {0}/{num_images - 1}")
+    #axes[0].axis('off')  # Hide axes
+    plt.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
+    
+    # Plot the second image
+    im2 = axes[1].imshow(img_list2[0], vmin = vmin2, vmax = vmax2, cmap=cmap2)
+    axes[1].set_title(f"Image 1 {0}/{num_images - 1}")
+    #axes[1].axis('off')  # Hide axes
+    plt.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
+    
+    plt.tight_layout()
+    
+    def update_image(img_idx):
+        """Updates the displayed image when the slider is moved."""
+        img1 = img_list1[img_idx]
+        img_mean1 = np.mean(img1)
+
+        img2 = img_list2[img_idx]
+        img_mean2 = np.mean(img2)
+        
+        vmin1 = max(img_mean1 - scale_fac * img_mean1, 0)
+        vmax1 = img_mean1 + scale_fac * img_mean1
+
+        vmin2 = img_mean2 - scale_fac * img_mean2
+        vmax2 = img_mean2 + scale_fac * img_mean2
+        
+        im1.set_data(img1)  # Update image data
+        im1.set_clim(vmin1, vmax1)
+
+        im2.set_data(img2)  # Update image data
+        im2.set_clim(vmin2, vmax2)
+        
+        axes[0].set_title(f"Image 1 {img_idx}/{num_images - 1}")  # Update title
+        axes[1].set_title(f"Image 2 {img_idx}/{num_images - 1}")  # Update title
+        fig.canvas.draw_idle()  # Efficient redraw
+
+    # Create interactive slider
+    interactive_plot = widgets.interactive(update_image, img_idx=img_slider)
+
+    display(interactive_plot)  # Show slider
+    #display(fig)  # Display the figure
+
+def plot_list_slider(img_list, scale_fac=0.3, vmin1 = None, vmax1 = None):
+    """Displays a list of coherent images and allows scrolling through them via a slider."""
+    
+
+    num_images = len(img_list)  # Number of images in the list
+    
+    # Create a slider for selecting the image index
+    img_slider = widgets.IntSlider(min=0, max=num_images - 1, value=0, description="Image")
+
+    # Create figure & axis once
+    fig, ax = plt.subplots(figsize=(6, 6))
+    
+    # Initial image
+    vmin, vmax = np.min(img_list[0]), np.max(img_list[0])  # Normalize color scale
+    im = ax.imshow(img_list[0], cmap='viridis', vmin=vmin1, vmax=vmax1)
+    ax.set_title(f"Image {0}/{num_images - 1}")
+    plt.colorbar(im, ax=ax, label="Intensity")
+    plt.tight_layout()
+    
+    def update_image(img_idx):
+        """Updates the displayed image when the slider is moved."""
+        img = img_list[img_idx]
+        img_mean = np.mean(img)
+
+        vmin1 = max(img_mean - scale_fac * img_mean,0)
+        
+        vmax1 = img_mean + scale_fac * img_mean
+        
+        im.set_data(img)  # Update image data
+        im.set_clim(vmin1, vmax1)
+        
+        ax.set_title(f"Image {img_idx}/{num_images - 1}")  # Update title
+        fig.canvas.draw_idle()  # Efficient redraw
+
+    # Create interactive slider
+    interactive_plot = widgets.interactive(update_image, img_idx=img_slider)
+
+    display(interactive_plot)  # Show slider
+    #display(fig)  # Display the figure
