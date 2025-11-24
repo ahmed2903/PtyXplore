@@ -350,6 +350,7 @@ def make_4d_dataset(roi: ROI, num_jobs = 64):
                                                     slow_axis = roi.slow_axis, 
                                                     conc=True, 
                                                     num_jobs=num_jobs)
+            
     roi.data_4d = mask_hot_pixels(data_4d, 
                                 mask_max_coh = False, 
                                 mask_min_coh = False)
