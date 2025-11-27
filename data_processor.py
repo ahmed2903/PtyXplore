@@ -12,16 +12,16 @@ from functools import wraps
 import json
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-
+from tqdm import tqdm 
 import os 
 
 from .data_fs import *
 from .kvectors import make_coordinates, compute_vectors, optimise_kin, reverse_kins_to_pixels, rotation_matrix, calc_qvec, extract_parallel_line, extract_streak_region
 
-from .utils import time_it, energy2wavelength_a, log_roi_params
+from .utils import time_it, log_roi_params
 from .geometry import *
 
-from .cbd_loader_ import ROI, Scan, Exp
+from .cbd_loader import ROI, Scan, Exp
 
 ################### Loading data ###################
 
@@ -690,4 +690,111 @@ def flip_images(roi:ROI, flip_mode):
         return np.flip(roi.coherent_imgs, axis=(1, 2))  # Flip along both axes
     else:
         raise ValueError(f"Invalid flip_mode: {flip_mode}")
+
+def sum_line(args):
+    file, dataset_key = args
+    with h5py.File(file, "r") as h5:
+            
+        dset = h5[dataset_key] 
+
+        accumulator = np.sum(dset, axis = 0)
+
+    return accumulator
+
+def sum_line(args):
+    file, dataset_key = args
+    with h5py.File(file, "r") as h5:
+            
+        dset = h5[dataset_key] 
+
+        accumulator = np.sum(dset, axis = 0)
+
+    return accumulator
+    
+@time_it
+def sum_detector_frames(scan: Scan, detector = 'Eiger', plot=False, num_jobs = 32):
+
+    if detector == 'Eiger':
+        dataset_key="entry/data/data"
+
+    elif detector == "Lambda":
+        dataset_key = "/entry/instrument/detector/data"
+        
+    args_list = [(file, dataset_key) for file in scan.file_list[:-1]]
+
+    print("got list")
+    
+    with Pool(processes=num_jobs) as pool:    
+        
+        sums = list(tqdm(
+            pool.imap(sum_line, args_list),
+            total=len(args_list),
+            desc="Loading frames"
+        ))
+
+    print("Sum Done")
+    stacked_data = np.array(sums)
+    accumulator = np.sum(stacked_data, axis=0)
+
+    accumulator = mask_hot_pixels(accumulator)
+
+    print("Masking done")
+    
+    if plot:
+        plt.figure()
+        plt.imshow(accumulator)
+        plt.title(f"Summed Detector Frames; Scan no. {scan.scan_num}")
+        plt.show()
+
+    else:
+        return accumulator
+
+def std_line(args):
+    file, dataset_key = args
+    with h5py.File(file, "r") as h5:
+            
+        dset = h5[dataset_key] 
+
+        accumulator = np.std(dset, axis = 0)
+
+    return accumulator
+    
+@time_it
+def std_detector_frames(scan: Scan, detector = 'Eiger', plot=False, num_jobs = 32):
+
+    if detector == 'Eiger':
+        dataset_key="entry/data/data"
+
+    elif detector == "Lambda":
+        dataset_key = "/entry/instrument/detector/data"
+        
+    args_list = [(file, dataset_key) for file in scan.file_list[:-1]]
+
+    print("got list")
+    
+    with Pool(processes=num_jobs) as pool:    
+        
+        sums = list(tqdm(
+            pool.imap(std_line, args_list),
+            total=len(args_list),
+            desc="Loading frames"
+        ))
+
+    print("Sum Done")
+    stacked_data = np.array(sums)
+    accumulator = np.std(stacked_data, axis=0)
+
+    accumulator = mask_hot_pixels(accumulator)
+
+    print("Masking done")
+    
+    if plot:
+        plt.figure()
+        plt.imshow(accumulator)
+        plt.title(f"Summed Detector Frames; Scan no. {scan.scan_num}")
+        plt.show()
+
+    else:
+        return accumulator
+        
         
