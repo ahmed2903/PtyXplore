@@ -1,9 +1,10 @@
 # Define the objective function
 
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import minimize, least_squares
 from scipy.spatial import KDTree
 from sklearn.decomposition import PCA
+import math 
 
 def rotation_matrix(alpha, beta, gamma):
     # Construct rotation matrix using standard formulas
@@ -53,11 +54,14 @@ def optimise_kin(G_init, ttheta, kouts, wavelength, method, gtol):
     initial_guess = [0, 0, 0]
 
     # Perform optimization
-    result = minimize(objective_function, initial_guess, args=(kouts, G_init, ttheta, wavelength),
-                  method=method, options={'disp': True, 
-                                        "gtol" : gtol, 
-                                        #'return_all': True
-                                        })
+    result = minimize(objective_function, 
+                      initial_guess, 
+                      args=(kouts, G_init, ttheta, wavelength),
+                        method=method, 
+                      options={'disp': True, 
+                                "gtol" : gtol, 
+                               #'return_all': True
+                                })
 
     # Optimized orientation
     optimal_angles = result.x
@@ -74,6 +78,93 @@ def optimise_kin(G_init, ttheta, kouts, wavelength, method, gtol):
     #kin_opt *= 2*np.pi/wavelength
 
     return kin_opt, optimal_angles
+    
+
+def objective_function_w_geometry(params, pixel_coords_out, pixel_coords_in, G_initial, wavelength, pixel_size, central_pixel):
+    
+    # Rotate G using Euler angles, Refine kouts using detector distance
+    det_distance, alpha, beta, gamma  = params
+
+    # Get new G esimate
+    R = rotation_matrix(alpha, beta, gamma)
+    try:
+        G = R @ G_initial
+    except:
+        G = R @ G_initial[0]
+    
+
+    k_mag = 2*np.pi/wavelength 
+
+    # Get new kouts
+    kouts = compute_vectors(pixel_coords_out, det_distance, pixel_size, central_pixel, wavelength)
+
+    # Get new kins
+    kins_pupil = compute_vectors(pixel_coords_in, det_distance, pixel_size, central_pixel, wavelength)
+    
+    # Update k_in
+    kins_calc = kouts - G
+    
+
+    # ---- elastic scattering + Bragg condition
+    r_elastic = np.abs(np.linalg.norm(kins_calc, axis=1) - k_mag)
+    r_kout = np.abs(np.linalg.norm(kouts, axis=1) - k_mag)
+
+    
+    # --- pupil support    
+    kx_bds, ky_bds = compute_k_bounds(kins_pupil)
+
+    kx_min, kx_max = kx_bds
+    ky_min, ky_max = ky_bds
+    
+    r_pupil_x = np.maximum(0, kins_calc[:,0] - kx_max) + np.maximum(0, kx_min - kins_calc[:,0])
+    r_pupil_y = np.maximum(0, kins_calc[:,1] - ky_max) + np.maximum(0, ky_min - kins_calc[:,1])
+    r_pupil = r_pupil_x + r_pupil_y
+
+    w_pupil = 1
+    w_elastic = 1
+    w_kout = 0
+    
+    return np.sum(
+        w_kout * r_kout +
+        w_elastic * r_elastic+
+        w_pupil * r_pupil)/(w_pupil+w_elastic)
+    
+def optimise_kin_w_geometry(G_init, det_distance_init, kin_pixels, kout_pixels, wavelength, pixel_size, central_pixel, method, gtol):
+
+    # Initial guess for optimization
+    initial_guess = [det_distance_init, 0, 0, 0]
+
+    # Perform optimization
+    result = minimize(objective_function_w_geometry, 
+                      initial_guess, 
+                      args=(kout_pixels, kin_pixels, G_init, wavelength, pixel_size, central_pixel),
+                        method=method,
+                      options={'disp': True, 
+                                "gtol" : gtol, 
+                                })
+
+    # Optimized orientation
+    optimal_params = result.x
+
+    optimal_angles = optimal_params[1:]
+    optimal_distance = optimal_params[0]
+    
+    opt_mat = rotation_matrix(*optimal_angles)
+
+    try:
+        G_opt =  opt_mat @ G_init
+    except:
+        G_opt =  opt_mat @ G_init[0]
+
+    kouts = compute_vectors(kout_pixels, optimal_distance, pixel_size, central_pixel, wavelength)
+    kins = compute_vectors(kin_pixels, optimal_distance, pixel_size, central_pixel, wavelength)
+    
+    kin_opt = (kouts-G_opt)
+    #kin_opt /= np.linalg.norm(kin_opt, axis = 1)[:,np.newaxis]
+    #kin_opt *= 2*np.pi/wavelength
+
+    return kin_opt, kouts, kins, optimal_params
+
 
 def calc_qvec(kout, kin, **kwargs):
     """
@@ -141,6 +232,12 @@ def reverse_kins_to_pixels(kins, pixel_size, detector_distance, central_pixel):
     coord = np.vstack((row_pixel_indices, col_pixel_indices)).T
 
     return coord
+
+def compute_k_bounds(ks):
+
+    kx_min, kx_max = np.min(ks[:,0]), np.max(ks[:,0])
+    ky_min, ky_max = np.min(ks[:,1]), np.max(ks[:,1])
+    return (kx_min, kx_max), (ky_min, ky_max)
     
 def compute_vectors(coordinates, detector_distance, pixel_size, central_pixel, wavelength):
     """
@@ -168,7 +265,7 @@ def compute_vectors(coordinates, detector_distance, pixel_size, central_pixel, w
         vectors.append(vector)
 
     pixel_vectors = np.array(vectors)
-    print(pixel_vectors.shape)
+    
     unit_vectors = pixel_vectors/np.linalg.norm(pixel_vectors, axis = 1)[:,np.newaxis]
     
     k = 2.0*np.pi /wavelength

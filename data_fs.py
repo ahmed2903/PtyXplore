@@ -10,7 +10,7 @@ from joblib import Parallel, delayed
 
 from multiprocessing import Pool
 
-import cv2
+# import cv2
 import h5py
 import os
 from skimage.measure import shannon_entropy
@@ -961,7 +961,20 @@ def reorder_pixels_from_center(pixel_coords, connected_array=None):
     sorted_indices = np.array(sorted_indices, dtype=int)
     
     return sorted_indices
+def sliding_bin_1d(images, k):
+    """ 
+    for bining data along the streak
+    assumes the images are ordered
+    """
+    N = images.shape[0]
+    out = np.empty_like(images)
 
+    k2 = k//2
+    for i in range(N):
+        start = max(0, i - k2)
+        end   = min(N, i + k2 + 1)
+        out[i] = images[start:end].mean(axis=0)
+    return out
 def flip_images(images, flip_mode):
     """
     Flips images based on the selected mode.

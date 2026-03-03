@@ -17,7 +17,7 @@ import os
 # import cv2
 
 from .data_fs import *
-from .kvectors import make_coordinates, compute_vectors, optimise_kin, reverse_kins_to_pixels, rotation_matrix, calc_qvec, extract_parallel_line, extract_streak_region
+from .kvectors import make_coordinates, compute_vectors, optimise_kin, optimise_kin_w_geometry, reverse_kins_to_pixels, rotation_matrix, calc_qvec, extract_parallel_line, extract_streak_region
 
 from .utils import time_it, log_roi_params
 from .geometry import *
@@ -177,16 +177,16 @@ def estimate_detector_distance(na1, na2, pupil_size):
     distance1 = estimate_detector_distance_from_NA(largest_na, pupil_size=max(pupil_size))
     distance2 = estimate_detector_distance_from_NA(smallest_na, pupil_size=min(pupil_size))
 
-    print(f"First detector distance is {distance1} microns")
-    print(f"Second detector distance is {distance2} mircons")
+    print(f"First detector distance is {max(distance1, distance2)} nm")
+    print(f"Second detector distance is {min(distance1,distance2)} nm")
     
-    return (distance1+distance2)/2
+    return max(distance1,distance2), min(distance1,distance2)
 
 
 ################### prepare detector roi ###################
 
 @log_roi_params
-def pool_detector_space(roi:ROI, kernel_size, padding=0):
+def pool_detector(roi:ROI, kernel_size, stride = None, padding=0):
     """Performs pooling on the detector space for a given region of interest (ROI).
     
     Args:
@@ -200,22 +200,57 @@ def pool_detector_space(roi:ROI, kernel_size, padding=0):
                                   edges of the image before pooling. Defaults to 0.
     """
     print("Pooling detector ...")
+
+    if stride is None: 
+        stride = kernel_size
+    
     
     roi.data_4d = sum_pool2d_array(roi.data_4d, kernel_size=kernel_size,
-                                                   stride=None,
+                                                   stride=stride,
                                                    padding=0)
             
     
-    roi.det_psize *= kernel_size
+    roi.det_psize *= stride
 
     if roi.kout_coords is not None:
-        roi.kout_coords = np.unique(roi.kout_coords // kernel_size)
+        roi.kout_coords = np.unique(roi.kout_coords // stride)
     
-    roi.coords = list(np.array(roi.coords) // kernel_size)
+    roi.coords = list(np.array(roi.coords) // stride)
     roi.averaged_det_images = np.mean(roi.data_4d, axis = (0,1))
     
     print("Done.")
 
+# @log_roi_params
+# def pool_detector(roi:ROI, kernel_size, stride = 1, padding=0):
+#     """Performs pooling on the detector space for a given region of interest (ROI).
+    
+#     Args:
+#         roi_name (str): The name of the region of interest (ROI) to be processed.
+#         kernel_size (int): The size of the pooling kernel, determining the window 
+#                             over which the sum pooling is applied.
+#         stride (int, optional): The stride of the pooling operation, i.e., the 
+#                                  step size between each pooling operation. If 
+#                                  not provided, defaults to `kernel_size`.
+#         padding (int, optional): The amount of zero padding to add around the 
+#                                   edges of the image before pooling. Defaults to 0.
+#     """
+#     print("Pooling detector ...")
+    
+#     roi.data_4d = sum_pool2d_array(roi.data_4d, kernel_size=kernel_size,
+#                                                    stride=1,
+#                                                    padding=0)
+            
+    
+#     roi.det_psize *= stride
+
+#     if roi.kout_coords is not None:
+#         roi.kout_coords = np.unique(roi.kout_coords // stride)
+    
+#     roi.coords = list(np.array(roi.coords) // stride)
+#     roi.averaged_det_images = np.mean(roi.data_4d, axis = (0,1))
+    
+#     print("Done.")
+    
     
 @log_roi_params    
 def normalise_detector(roi:ROI, reference_roi:ROI):
@@ -365,7 +400,42 @@ def compute_kins(roi:ROI, pupil_roi:ROI, est_ttheta, method = "BFGS", gtol = 1e-
                                                        roi.det_distance, 
                                                        roi.centre_pixel)
 
+@log_roi_params
+def compute_kins_w_geometry(roi:ROI, pupil_roi:ROI, method = "BFGS", gtol = 1e-6):
+    """
+    Computes the incident wavevectors (kins) for a given region of interest (ROI) 
+    by optimizing the initial q-vector estimate.
 
+    Args:
+        roi_name (str): 
+            The name of the region of interest (ROI) for which kins are computed.
+        est_ttheta (float): 
+            Estimated scattering angle (two-theta) in radians.
+        method (str, optional): 
+            Optimization method to use for minimizing the k-vector difference. 
+            Defaults to "BFGS".
+        gtol (float, optional): 
+            Gradient tolerance for optimization. Defaults to 1e-6.
+    """
+
+    roi.g_init = calc_qvec(roi.kouts, pupil_roi.kins_avg)
+
+    
+    roi.kins, roi.kouts, pupil_roi.kins, params = optimise_kin_w_geometry(roi.g_init, roi.det_distance, 
+                                                                  pupil_roi.kin_coords, roi.kout_coords, roi.wavelength,
+                                                                          roi.det_psize, roi.centre_pixel,
+                                                                          method, gtol)
+    det_distance = params[0]
+    optimal_angles = params[1:]
+    
+    roi.optimal_angles = optimal_angles
+    roi.det_distance = det_distance
+    pupil_roi.det_distance = det_distance
+    roi.kin_coords = reverse_kins_to_pixels(roi.kins, 
+                                                       roi.det_psize, 
+                                                       roi.det_distance, 
+                                                       roi.centre_pixel)
+    
     
 @log_roi_params
 def refine_kins(roi:ROI, shifts):
@@ -424,6 +494,19 @@ def select_single_pixel_streak(roi:ROI, width=1, offset=0, inplace = False):
         return  
     else:
         return mask
+
+def make_parallel_streaks(roi:ROI, width, extent, mask_thr = 0):
+    
+    offsets = np.arange(-extent,extent,width)
+    masks = [select_single_pixel_streak(roi, width = width, offset = off, inplace = False) for off in offsets]
+    masks_clean= [mask for mask in masks if np.sum(mask)>mask_thr]
+    
+    roi.coherent_imgs = [roi.coherent_imgs[mask] for mask in masks_clean]
+    roi.kins = [roi.kins[mask] for mask in masks_clean]
+    roi.kouts = [roi.kouts[mask] for mask in masks_clean]
+    roi.kin_coords = [roi.kin_coords[mask] for mask in masks_clean]
+    roi.kout_coords = [roi.kout_coords[mask] for mask in masks_clean]
+    
     
 def select_streak_region(roi:ROI, percentage=10, start_position='lowest', start_idx=None, inplace = False):
     """
@@ -439,6 +522,8 @@ def select_streak_region(roi:ROI, percentage=10, start_position='lowest', start_
     
     mask = extract_streak_region(roi.kin_coords, percentage=percentage, start_position=start_position, 
                                  start_idx=start_idx, seed=42)
+    masks_clean= [mask for mask in masks if np.sum(mask)!=0]
+
     if inplace:
         roi.kins = roi.kins[mask]
         roi.kin_coords = roi.kin_coords[mask]
@@ -448,6 +533,24 @@ def select_streak_region(roi:ROI, percentage=10, start_position='lowest', start_
     else:
         return mask
 
+
+    
+def bin_along_streak(roi:ROI, bin_size=4):
+    """
+    before running: coherent images have to be made into a list of images, each element corresponding to single pixel wide streak. 
+
+    assumes the images are ordered along the streak
+    """
+
+    binned = []
+    for img_arr in roi.coherent_imgs:
+
+        img_binned = sliding_bin_1d(img_arr, k=bin_size)
+        binned.append(img_binned)
+
+    roi.coherent_imgs = binned
+    
+    
 def order_pixels(roi:ROI):
     """Reorders the pixels of coherent images and corresponding k-vectors based on their distance from the center.
 
@@ -546,7 +649,7 @@ def remove_coh_background(roi:ROI, sigma, num_jobs = -1):
     
     roi.coherent_imgs = remove_background_parallel(roi.coherent_imgs, sigma=sigma, n_jobs=num_jobs)
     
-def even_dims_cohimages(roi:ROI, mode = 'constant', num_jobs = -1, **kwargs):
+def even_dims_cohimages(roi:ROI, mode = 'edge', num_jobs = -1, **kwargs):
     """Adjusts the dimensions of coherent images to be even.
 
     This method takes the coherent images for a given region of interest (ROI) 
@@ -560,8 +663,7 @@ def even_dims_cohimages(roi:ROI, mode = 'constant', num_jobs = -1, **kwargs):
     """
     
     roi.coherent_imgs = make_2dimensions_even(roi.coherent_imgs, mode=mode, num_jobs=num_jobs, **kwargs)
-    roi.averaged_coherent_images = make_2dimensions_even([roi.averaged_coherent_images],mode=mode,
-                                                                    num_jobs=num_jobs)[0]
+    roi.averaged_coherent_images = np.mean(roi.coherent_imgs, axis = 0)
 
 
 @log_roi_params
