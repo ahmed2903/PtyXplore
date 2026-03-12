@@ -668,5 +668,7 @@ def show():
     )
 
 
+dashboard.servable()
+
 if __name__ == "__main__":
     dashboard.show()
