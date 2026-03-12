@@ -9,6 +9,7 @@ import h5py
 import copy
 import json
 from dataclasses import dataclass, field, fields
+from functools import wraps
 import re
 
 import glob
@@ -85,7 +86,7 @@ class Scan:
         self.file_list = files_h5 if len(files_h5) else files_nxs
 
         if len(self.file_list) == 0:
-            raise FileNotFoundError(f"No .h5 or .nxs files found in {data_dir}")
+            raise FileNotFoundError(f"No .h5 or .nxs files found in {self.data_dir}")
 
         if all(hasattr(self, x) for x in ["scan_x_start_point", "scan_x_end_point", "scan_x_steps_count"]):
             self.step_size_x = (self.scan_x_end_point - self.scan_x_start_point) / self.scan_x_steps_count
@@ -353,6 +354,9 @@ class ROI:
 
     # _____________ Checkpointing _____________
     
+    # Name-mangled private cache attributes not in __dataclass_fields__
+    _PRIVATE_CACHE_ATTRS = ("_ROI__averaged_det_images", "_ROI__averaged_coherent_images")
+
     def checkpoint_state(self):
         """Save a deep copy of the current state for potential rollback."""
         state = copy.deepcopy({
@@ -360,6 +364,9 @@ class ROI:
             for key in self.__dataclass_fields__.keys()
             if key not in ("checkpoint_stack", "log_params")  # don't save logs or stack itself
         })
+        # Also save the private cached arrays (name-mangled, not in __dataclass_fields__)
+        for attr in self._PRIVATE_CACHE_ATTRS:
+            state[attr] = copy.deepcopy(getattr(self, attr, None))
         self.checkpoint_stack.append(state)
         print(f"[ROI] Checkpoint #{len(self.checkpoint_stack)} created.")
 
@@ -371,7 +378,7 @@ class ROI:
 
         last_state = self.checkpoint_stack.pop()
         for key, value in last_state.items():
-            setattr(self, key, value)
+            setattr(self, key, value)  # works for both normal and mangled names
     
     def auto_checkpoint(func):
         @wraps(func)

@@ -1,7 +1,7 @@
 # Define the objective function
 
 import numpy as np
-from scipy.optimize import minimize, least_squares
+from scipy.optimize import minimize
 from scipy.spatial import KDTree
 from sklearn.decomposition import PCA
 import math 

@@ -4,25 +4,21 @@
 # Email: ahmed.mokhtar@desy.de
 # Date : Feb 2025
 
-import numpy as np 
+import numpy as np
 import h5py
 import matplotlib.pyplot as plt
-import copy
-from functools import wraps
-import json
-from dataclasses import dataclass, field, fields
-from pathlib import Path
-from tqdm import tqdm 
-import os 
+from multiprocessing import Pool
+from tqdm import tqdm
 # import cv2
 
-from .data_fs import *
+from .data_io import *
+from .data_proc import *
 from .kvectors import make_coordinates, compute_vectors, optimise_kin, optimise_kin_w_geometry, reverse_kins_to_pixels, rotation_matrix, calc_qvec, extract_parallel_line, extract_streak_region
 
 from .utils import time_it, log_roi_params
 from .geometry import *
 
-from .cbd_loader import ROI, Scan, Exp
+from .cbd_loader import ROI, Scan
 
 ################### Loading data ###################
 

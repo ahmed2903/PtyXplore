@@ -1,5 +1,7 @@
 
-from . import data_fs 
+from . import data_io
+from . import data_proc
+from . import roi_ops
 from . import kvectors
 from . import plotting
 from . import utils

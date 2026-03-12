@@ -1,4 +1,5 @@
-import time 
+import ast
+import time
 import re
 from functools import wraps
 
@@ -205,8 +206,8 @@ def parse_log(log_str):
                     # Convert Python list literal
                     if val.startswith("[") and val.endswith("]"):
                         try:
-                            val = eval(val)
-                        except:
+                            val = ast.literal_eval(val)
+                        except (ValueError, SyntaxError):
                             pass
                     else:
                         # Try to convert numeric types with units

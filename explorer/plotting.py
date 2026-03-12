@@ -9,7 +9,8 @@ import ipywidgets as widgets
 import os
 import h5py
 from .cbd_loader import ROI
-from .data_fs import mask_hot_pixels, make_coherent_image, make_detector_image, stack_4d_data_old, compute_histograms
+from .data_proc import mask_hot_pixels, make_coherent_image, make_detector_image, compute_histograms
+from .data_io import stack_4d_data_old
 
 def plot_detector_roi(roi:ROI, file_no, frame_no, title=None, vmin=None, vmax=None,mask_hot = True, save=False):
     """Plots a region of interest (ROI) on the detector for a given frame.
@@ -449,7 +450,6 @@ def create_gif_from_arrays(array_list, gif_name, fps=10, cmap="viridis"):
     
     # Cleanup temporary frame files
     for file in frame_files:
-        import os
         os.remove(file)
 
 def two_lists_one_gif(array_list1, array_list2, gif_name, title1 = "Image 1", title2 = "Image 2", fps=10, cmap="viridis"):
@@ -505,9 +505,8 @@ def two_lists_one_gif(array_list1, array_list2, gif_name, title1 = "Image 1", ti
     
     # Cleanup temporary frame files
     for file in frame_files:
-        import os
         os.remove(file)
-        
+
 def plot_pixel_space(ordered_pixels, connection=False):
     """
     Plots the pixel coordinates before and after reordering.
