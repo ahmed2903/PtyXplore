@@ -402,7 +402,6 @@ stats_html = pn.pane.HTML(
 def _update_scan_stats(scan):
     n_files = len(getattr(scan, "file_list", []) or [])
     energy  = getattr(scan, "energy", None)
-    e_str   = f"{energy*1e-3:.4f}" if energy else "—"
     sx = getattr(scan, "step_size_x", None)
     sy = getattr(scan, "step_size_y", None)
     px = getattr(scan, "scan_x_steps_count", None)
@@ -411,9 +410,9 @@ def _update_scan_stats(scan):
         "<div class='stat-grid'>"
         f"<div class='stat-chip'><div class='val'>{scan.scan_num}</div><div class='lbl'>Scan #</div></div>"
         f"<div class='stat-chip'><div class='val'>{n_files}</div><div class='lbl'>Files</div></div>"
-        f"<div class='stat-chip'><div class='val'>{f'{energy*1e-3:.4f}' if energy else '—'}</div><div class='lbl'>Energy (keV)</div></div>"
-        f"<div class='stat-chip'><div class='val'>{f'{sx*1e9:.2f}' if sx else '—'}</div><div class='lbl'>Step X (nm)</div></div>"
-        f"<div class='stat-chip'><div class='val'>{f'{sy*1e9:.2f}' if sy else '—'}</div><div class='lbl'>Step Y (nm)</div></div>"
+        f"<div class='stat-chip'><div class='val'>{f'{energy:.4f}' if energy else '—'}</div><div class='lbl'>Energy (keV)</div></div>"
+        f"<div class='stat-chip'><div class='val'>{f'{sx:.2f}' if sx else '—'}</div><div class='lbl'>Step X (nm)</div></div>"
+        f"<div class='stat-chip'><div class='val'>{f'{sy:.2f}' if sy else '—'}</div><div class='lbl'>Step Y (nm)</div></div>"
         f"<div class='stat-chip'><div class='val'>{f'{px}×{py}' if (px and py) else '—'}</div><div class='lbl'>Points X×Y</div></div>"
         "</div>"
     )
@@ -436,7 +435,7 @@ def on_create_exp(event):
         log("Beamtime ID is required.", "err"); _set_status(False); return
     log(f"Creating Exp(year={year}, beamtime_id='{btid}', beamline='{bl}')…", "info")
     try:
-        from explorer.cbd_loader import Exp
+        from ptyxplore.cbd_loader import Exp
         state["exp"] = Exp(year=year, beamtime_id=btid, beamline=bl)
         log(f"Exp created ✓  scan_frames → {state['exp'].scan_frames_dir}", "ok")
         _set_status(True)
@@ -456,7 +455,7 @@ def on_create_scan(event):
     ddist  = w_det_dist.value
     log(f"Loading Scan {snum} (det={det}, dist={ddist} m)…", "info")
     try:
-        from explorer.cbd_loader import Scan
+        from ptyxplore.cbd_loader import Scan
         state["scan"] = Scan(exp=state["exp"], scan_num=snum,
                              detector=det, sample_name=sample, det_distance=ddist)
         scan = state["scan"]
@@ -466,9 +465,9 @@ def on_create_scan(event):
             f"<div style='font-family:JetBrains Mono,monospace;font-size:12px;line-height:1.9'>"
             f"<span style='color:var(--txt-muted)'>data_dir  :</span> <span style='color:var(--txt)'>{scan.data_dir}</span><br>"
             f"<span style='color:var(--txt-muted)'>slow_axis :</span> <span style='color:{ACCENT2}'>{scan.slow_axis}</span><br>"
-            f"<span style='color:var(--txt-muted)'>wavelength:</span> <span style='color:{ACCENT}'>{scan.wavelength*1e10:.4f} Å</span>"
-            f"&nbsp;&nbsp;<span style='color:var(--txt-muted)'>energy:</span> <span style='color:{ACCENT}'>{scan.energy*1e-3:.4f} keV</span><br>"
-            f"<span style='color:var(--txt-muted)'>det psize :</span> <span style='color:var(--txt)'>{scan.det_psize*1e6:.0f} µm</span>"
+            f"<span style='color:var(--txt-muted)'>wavelength:</span> <span style='color:{ACCENT}'>{scan.wavelength*10:.4f} Å</span>"
+            f"&nbsp;&nbsp;<span style='color:var(--txt-muted)'>energy:</span> <span style='color:{ACCENT}'>{scan.energy:.4f} keV</span><br>"
+            f"<span style='color:var(--txt-muted)'>det psize :</span> <span style='color:var(--txt)'>{scan.det_psize*1e-3:.0f} µm</span>"
             f"</div>"
         )
         import pandas as pd
@@ -625,7 +624,7 @@ def on_add_roi(event):
     coords = [w_roi_rs.value, w_roi_re.value, w_roi_cs.value, w_roi_ce.value]
     centre = [w_roi_cx.value, w_roi_cy.value]
     try:
-        from explorer.cbd_loader import ROI
+        from ptyxplore.cbd_loader import ROI
         roi = ROI(scan=state["scan"], kind=kind, coords=coords, centre_pixel=centre)
         state["rois"][name] = roi
         state["roi_history"][name] = [f"[{ts()}] Created ({kind}, coords={coords})"]
@@ -833,6 +832,9 @@ def _refresh_pipe_roi_select():
     w_pipe_roi.options = opts
     if w_pipe_roi.value not in names:
         w_pipe_roi.value = names[0] if names else "— none —"
+    w_4dv_roi.options = opts
+    if w_4dv_roi.value not in names:
+        w_4dv_roi.value = names[0] if names else "— none —"
 
 
 def _rebuild_queue():
@@ -888,7 +890,7 @@ def _execute_step(item: dict) -> None:
     scan     = state["scan"]
     pupil    = state["rois"].get(state["pupil_name"]) if state["pupil_name"] else None
 
-    from explorer import roi_ops
+    from ptyxplore import roi_ops
 
     if op == "Sum detector frames":
         result = roi_ops.sum_detector_frames(scan, num_jobs=params.get("num_jobs", 32))
@@ -897,6 +899,8 @@ def _execute_step(item: dict) -> None:
     elif op == "Make 4D dataset":
         roi_ops.make_4d_dataset(roi, num_jobs=params.get("num_jobs", 32))
         _add_roi_history(roi_name, f"Make 4D dataset → shape={roi.data_4d.shape}")
+        if w_4dv_roi.value == roi_name:
+            _on_4dv_roi_change(type('_', (), {'new': roi_name})())
     elif op == "Pool detector":
         roi_ops.pool_detector(roi, params["kernel_size"], params["stride"], params["padding"])
         _add_roi_history(roi_name, f"Pool detector → {roi.data_4d.shape}")
@@ -965,7 +969,7 @@ def _execute_step(item: dict) -> None:
     elif op == "Plot: 4D viewer (single)":
         if roi.data_4d is None:
             raise ValueError("Run Make 4D dataset first.")
-        from explorer.data_proc import make_coherent_image, make_detector_image
+        from ptyxplore.data_proc import make_coherent_image, make_detector_image
         px, py = params["px"], params["py"]
         coh = make_coherent_image(roi.data_4d, np.array([px, py]))
         det = make_detector_image(roi.data_4d, np.array([0, 0]))
@@ -1172,6 +1176,76 @@ btn_avg_frame.on_click(on_avg_frame)
 btn_gallery_clear.on_click(on_gallery_clear)
 _rebuild_gallery()
 
+# ─── 4D Dataset Viewer ───────────────────────────────────────────────────────
+w_4dv_roi  = pn.widgets.Select(name="ROI", options=["— none —"], value="— none —", width=200)
+w_4dv_prow = pn.widgets.IntSlider(name="py (det row)", start=0, end=1, value=0, width=300)
+w_4dv_pcol = pn.widgets.IntSlider(name="px (det col)", start=0, end=1, value=0, width=300)
+w_4dv_lrow = pn.widgets.IntSlider(name="ly (scan row)", start=0, end=1, value=0, width=300)
+w_4dv_lcol = pn.widgets.IntSlider(name="lx (scan col)", start=0, end=1, value=0, width=300)
+w_4dv_cmap_coh = pn.widgets.Select(name="coh cmap", options=["plasma","viridis","jet","gray","hot"], value="plasma", width=130)
+w_4dv_cmap_det = pn.widgets.Select(name="det cmap", options=["viridis","plasma","jet","gray","hot"], value="viridis", width=130)
+
+fourD_pane = pn.pane.Matplotlib(sizing_mode="stretch_width", tight=True, height=420)
+fourD_msg  = pn.pane.HTML("", sizing_mode="stretch_width")
+_fourD_fig = [None]
+
+
+def _update_4d_viewer(*_):
+    roi_name = w_4dv_roi.value
+    if not roi_name or roi_name == "— none —" or roi_name not in state["rois"]:
+        fourD_msg.object = "<span style='color:var(--txt-muted)'>Select a ROI with 4D data loaded.</span>"
+        fourD_pane.object = None
+        return
+    roi = state["rois"][roi_name]
+    if roi.data_4d is None:
+        fourD_msg.object = "<span style='color:var(--warn)'>Run Make 4D dataset on this ROI first.</span>"
+        fourD_pane.object = None
+        return
+    fourD_msg.object = ""
+    from ptyxplore.data_proc import make_coherent_image, make_detector_image
+    prow, pcol = w_4dv_prow.value, w_4dv_pcol.value
+    lrow, lcol = w_4dv_lrow.value, w_4dv_lcol.value
+    coh = make_coherent_image(roi.data_4d, np.array([prow, pcol]))
+    det = make_detector_image(roi.data_4d, np.array([lrow, lcol]))
+    if _fourD_fig[0] is not None:
+        plt.close(_fourD_fig[0])
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+    m = np.mean(coh)
+    im0 = axes[0].imshow(coh, cmap=w_4dv_cmap_coh.value, vmin=m - 0.05 * abs(m), vmax=m + 0.05 * abs(m))
+    axes[0].set_title(f"Coherent  px=({pcol}, {prow})")
+    axes[0].add_patch(Rectangle((lcol - 1, lrow - 1), 2, 2, edgecolor='white', facecolor='none', lw=1.5))
+    plt.colorbar(im0, ax=axes[0])
+    m2 = np.mean(det)
+    im1 = axes[1].imshow(det, cmap=w_4dv_cmap_det.value, vmin=m2 - 0.3 * abs(m2), vmax=m2 + 0.2 * abs(m2))
+    axes[1].set_title(f"Detector  lx=({lcol}, {lrow})")
+    axes[1].add_patch(Rectangle((pcol - 2, prow - 2), 4, 4, edgecolor='white', facecolor='none', lw=1.5))
+    plt.colorbar(im1, ax=axes[1])
+    plt.tight_layout()
+    _fourD_fig[0] = fig
+    fourD_pane.object = fig
+    plt.close(fig)
+
+
+def _on_4dv_roi_change(event):
+    roi_name = event.new
+    if not roi_name or roi_name == "— none —" or roi_name not in state["rois"]:
+        return
+    roi = state["rois"][roi_name]
+    if roi.data_4d is None:
+        _update_4d_viewer()
+        return
+    dsh, csh = roi.data_4d.shape[2:], roi.data_4d.shape[:2]
+    w_4dv_prow.end = dsh[0] - 1;  w_4dv_prow.value = dsh[0] // 2
+    w_4dv_pcol.end = dsh[1] - 1;  w_4dv_pcol.value = dsh[1] // 2
+    w_4dv_lrow.end = csh[0] - 1;  w_4dv_lrow.value = csh[0] // 2
+    w_4dv_lcol.end = csh[1] - 1;  w_4dv_lcol.value = csh[1] // 2
+    _update_4d_viewer()
+
+
+w_4dv_roi.param.watch(_on_4dv_roi_change, 'value')
+for _w4 in (w_4dv_prow, w_4dv_pcol, w_4dv_lrow, w_4dv_lcol, w_4dv_cmap_coh, w_4dv_cmap_det):
+    _w4.param.watch(_update_4d_viewer, 'value')
+
 tab_vis = pn.Column(
     pn.Column(
         pn.pane.HTML("<p class='section-label'>Frame Browser</p>", sizing_mode="stretch_width"),
@@ -1179,6 +1253,14 @@ tab_vis = pn.Column(
         pn.Row(w_log_scale, w_cmap_vis, w_vmin_vis, w_vmax_vis, align="end"),
         pn.Row(btn_load_frame, btn_avg_frame),
         vis_pane, vis_info,
+        sizing_mode="stretch_width", css_classes=["ptycho-card"], margin=(0, 0, 16, 0),
+    ),
+    pn.Column(
+        pn.pane.HTML("<p class='section-label'>4D Dataset Viewer</p>", sizing_mode="stretch_width"),
+        pn.Row(w_4dv_roi, w_4dv_cmap_coh, w_4dv_cmap_det, align="end"),
+        pn.Row(w_4dv_prow, w_4dv_pcol),
+        pn.Row(w_4dv_lrow, w_4dv_lcol),
+        fourD_msg, fourD_pane,
         sizing_mode="stretch_width", css_classes=["ptycho-card"], margin=(0, 0, 16, 0),
     ),
     pn.Column(

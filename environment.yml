@@ -1,8 +1,6 @@
 name: ptyxplore
 channels:
-  - pytorch
   - conda-forge
-  - defaults
 dependencies:
   - python>=3.10
   - numpy>=1.26.4
@@ -13,11 +11,13 @@ dependencies:
   - scikit-image>=0.25.2
   - joblib>=1.4.2
   - matplotlib>=3.8.2
-  - pillow>=11.1.0
+  - pillow
   - ipywidgets>=8.1.5
   - ipython>=8.33.0
+  - ipykernel>=6.29
+  - hdf5plugin
   - pandas>=2.2.3
-  - pytorch>=2.7.1
+  - pytorch>=2.4,<2.7
   - pip
   - pip:
       - panel>=1.8.8

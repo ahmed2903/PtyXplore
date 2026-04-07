@@ -6,6 +6,13 @@ Ptychography data exploration and processing toolkit for PETRA III experiments a
 
 ## Installation
 
+Clone the repository:
+
+```bash
+git clone https://github.com/ahmed2903/PtyXplore.git
+cd PtyXplore
+```
+
 ### Option 1 — Conda (recommended)
 
 ```bash
@@ -47,17 +54,19 @@ Then open **http://localhost:5006/ptycho_dashboard** in your browser.
 
 ```
 ptyxplore/
-├── explorer/
+├── ptyxplore/
+│   ├── __init__.py
 │   ├── cbd_loader.py     # Exp, Scan, ROI dataclasses
+│   ├── cli.py            # Command-line entry point
 │   ├── data_io.py        # HDF5 / NXS file loading and stacking
 │   ├── data_proc.py      # Image processing (filtering, pooling, alignment)
 │   ├── roi_ops.py        # ROI-level operations and k-vector pipeline
+│   ├── roi_plotting.py   # ROI-based plotting utilities
 │   ├── kvectors.py       # k-space vector computation and optimisation
 │   ├── geometry.py       # Geometric optics utilities (NA, detector distance)
 │   ├── plotting.py       # Matplotlib / ipywidgets visualisation
 │   └── utils.py          # Unit conversions, decorators, log parsing
 ├── ptycho_dashboard.py   # Panel-based interactive dashboard
-├── requirements.txt
 ├── environment.yml
 └── setup.py
 ```

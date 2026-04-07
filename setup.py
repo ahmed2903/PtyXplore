@@ -10,7 +10,7 @@ setup(
     python_requires=">=3.10",
     entry_points={
         "console_scripts": [
-            "ptyxplore=explorer.cli:run",
+            "ptyxplore=ptyxplore.cli:run",
         ],
     },
     install_requires=[
