@@ -78,17 +78,23 @@ def wavelength2energy(wavelength, unit = nm):
 # ----------------------
 # Helper functions
 # ----------------------
+_MOTOR_ALIASES = {
+    'sam_x': 'scan_x',
+    'sam_y': 'scan_y',
+}
+
 def clean_key(key):
     """
     Converts strings like:
     'SCAN-X [Position] (float64,um)' -> 'scan_x'
     'Start point' -> 'start_point'
+    'SAM-X [Position] (float64,um)' -> 'scan_x'
     """
     key = key.lower()
     key = re.sub(r'\[.*?\]|\(.*?\)', '', key)  # remove bracketed units
     key = re.sub(r'[^a-z0-9]+', '_', key)      # replace non-alphanum with _
     key = key.strip('_')
-    return key
+    return _MOTOR_ALIASES.get(key, key)
 
 
 def inject_attrs(obj, d, scan):
