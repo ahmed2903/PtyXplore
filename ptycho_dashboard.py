@@ -10,6 +10,7 @@ Or via CLI:
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 
 import panel as pn
 import numpy as np
@@ -17,6 +18,8 @@ from datetime import datetime
 import h5py
 import os
 import traceback
+import threading
+import copy
 
 pn.extension(
     "tabulator", "codeeditor",
@@ -182,7 +185,7 @@ pn.config.raw_css.append(CSS)
 log_lines: list[str] = []
 state = {
     "exp":             None,
-    "scan":            None,
+    "scans":           {},    # label → Scan object
     "current_frame":   None,
     "processed_frame": None,
     "rois":            {},    # name → ROI object
@@ -192,6 +195,9 @@ state = {
 _prev_figs: dict = {}
 pipeline_queue: list[dict] = []
 plot_gallery:   list[dict] = []
+roi_gallery_hooks: dict = {}   # roi_name → callable(title, fig) for per-ROI gallery
+roi_4dv_hooks:    dict = {}    # roi_name → callable() to refresh per-ROI 4D viewer
+_stop_event = threading.Event()  # set this to request a halt between pipeline steps
 
 
 def ts() -> str:
@@ -268,15 +274,141 @@ def _make_kcoord_fig(det_image, k_coords, coords, cmap, title):
     return fig
 
 
+def _bk_palette(cmap_name: str, n: int = 256) -> list:
+    """Convert a matplotlib colormap to a Bokeh-compatible hex palette list."""
+    import matplotlib.colors as mcolors
+    cmap = plt.get_cmap(cmap_name)
+    return [mcolors.to_hex(cmap(i / max(n - 1, 1))) for i in range(n)]
+
+
+def _make_bk_image_panel(data: np.ndarray, title: str,
+                          log_scale: bool = False, cmap: str = "viridis",
+                          vmin=None, vmax=None, height: int = 440) -> pn.Column:
+    """
+    Return an interactive Panel component wrapping a Bokeh image figure.
+    Features: scroll-to-zoom, pan, box-select for ROI, tap for point coords,
+              vmin/vmax inputs, autoscale button, Log Point and Log ROI buttons.
+    """
+    from bokeh.models import (
+        ColumnDataSource, LinearColorMapper, ColorBar,
+        HoverTool, CustomJS, BasicTicker,
+    )
+    from bokeh.plotting import figure as bk_figure
+
+    disp = np.log1p(np.abs(data.astype(float))) if log_scale else data.astype(float)
+    h, w = disp.shape
+    lo   = float(vmin) if vmin is not None else float(np.nanmin(disp))
+    hi   = float(vmax) if vmax is not None else float(np.nanmax(disp))
+    if abs(hi - lo) < 1e-10:
+        hi = lo + 1.0
+
+    bk_src = ColumnDataSource({'image': [disp], 'x': [0], 'y': [0], 'dw': [w], 'dh': [h]})
+    bk_map = LinearColorMapper(palette=_bk_palette(cmap), low=lo, high=hi, nan_color='black')
+
+    fig = bk_figure(
+        title=title, sizing_mode="stretch_width", height=height,
+        tools="pan,wheel_zoom,box_select,reset,tap", active_scroll="wheel_zoom",
+        match_aspect=True,
+        background_fill_color=BG_DARK, border_fill_color=BG_MID,
+    )
+    fig.y_range.flipped = True
+    fig.image('image', 'x', 'y', 'dw', 'dh', source=bk_src, color_mapper=bk_map)
+    fig.add_tools(HoverTool(tooltips=[("col", "$x{0}"), ("row", "$y{0}"), ("val", "@image")]))
+    fig.add_layout(ColorBar(color_mapper=bk_map, ticker=BasicTicker(), location=(0, 0)), 'right')
+
+    cur_src = ColumnDataSource({'x': [0.0], 'y': [0.0]})
+    sel_src = ColumnDataSource({'x0': [0.0], 'y0': [0.0], 'x1': [0.0], 'y1': [0.0]})
+    fig.js_on_event('tap', CustomJS(args={'s': cur_src}, code="""
+        s.data = {x: [cb_obj.x], y: [cb_obj.y]};  s.change.emit();
+    """))
+    fig.js_on_event('selectiongeometry', CustomJS(args={'s': sel_src}, code="""
+        if (cb_obj.geometry && cb_obj.geometry.type === 'rect') {
+            const g = cb_obj.geometry;
+            s.data = {x0: [Math.min(g.x0,g.x1)], y0: [Math.min(g.y0,g.y1)],
+                      x1: [Math.max(g.x0,g.x1)], y1: [Math.max(g.y0,g.y1)]};
+            s.change.emit();
+        }
+    """))
+
+    _cursor   = {'row': 0, 'col': 0}
+    _sel      = {'rs': 0, 're': 0, 'cs': 0, 'ce': 0}
+    coord_md  = pn.pane.HTML("", sizing_mode="stretch_width")
+    fi_vmin   = pn.widgets.FloatInput(name="vmin", width=100)
+    fi_vmax   = pn.widgets.FloatInput(name="vmax", width=100)
+    btn_auto  = pn.widgets.Button(name="Autoscale", button_type="default", width=95)
+    btn_lp    = pn.widgets.Button(name="Log Point [p]",  button_type="default", width=115)
+    btn_lr    = pn.widgets.Button(name="Log ROI [r]",    button_type="default", width=105)
+
+    def _fmt():
+        coord_md.object = (
+            f"<span style='font-family:JetBrains Mono,monospace;font-size:11px;"
+            f"color:var(--txt-muted)'>"
+            f"cursor → row={_cursor['row']}, col={_cursor['col']}"
+            f" &nbsp;|&nbsp; box → row=[{_sel['rs']},{_sel['re']}]"
+            f" col=[{_sel['cs']},{_sel['ce']}]</span>")
+
+    def _on_cur(attr, old, new):
+        _cursor['col'] = max(0, int(new['x'][0]))
+        _cursor['row'] = max(0, int(new['y'][0]))
+        pn.state.execute(_fmt)
+
+    def _on_sel(attr, old, new):
+        _sel['cs'] = max(0, int(new['x0'][0]))
+        _sel['ce'] = max(0, int(new['x1'][0]))
+        _sel['rs'] = max(0, int(new['y0'][0]))
+        _sel['re'] = max(0, int(new['y1'][0]))
+        pn.state.execute(_fmt)
+
+    cur_src.on_change('data', _on_cur)
+    sel_src.on_change('data', _on_sel)
+
+    def _on_scale(event=None):
+        _bk_map = bk_map
+        _bk_map.low  = fi_vmin.value if fi_vmin.value is not None else float(np.nanmin(bk_src.data['image'][0]))
+        _bk_map.high = fi_vmax.value if fi_vmax.value is not None else float(np.nanmax(bk_src.data['image'][0]))
+
+    def _on_auto(event):
+        fi_vmin.value = fi_vmax.value = None
+        d = bk_src.data['image'][0]
+        bk_map.low  = float(np.nanmin(d))
+        bk_map.high = float(np.nanmax(d))
+
+    fi_vmin.param.watch(_on_scale, 'value')
+    fi_vmax.param.watch(_on_scale, 'value')
+    btn_auto.on_click(_on_auto)
+
+    def _log_pt(event):
+        log(f"[{title}] Point → row={_cursor['row']}, col={_cursor['col']}", "info")
+
+    def _log_roi(event):
+        log(f"[{title}] ROI → row=[{_sel['rs']},{_sel['re']}], col=[{_sel['cs']},{_sel['ce']}]", "info")
+
+    btn_lp.on_click(_log_pt)
+    btn_lr.on_click(_log_roi)
+
+    return pn.Column(
+        fig,
+        pn.Row(fi_vmin, fi_vmax, btn_auto, btn_lp, btn_lr, coord_md, align="center"),
+        sizing_mode="stretch_width",
+    )
+
+
 def _add_roi_history(name: str, entry: str):
     if name and name in state["roi_history"]:
         state["roi_history"][name].append(f"[{ts()}] {entry}")
 
 
-def _add_to_gallery(title: str, fig) -> None:
-    pane = pn.pane.Matplotlib(fig, tight=True, sizing_mode="stretch_width", height=460)
-    plot_gallery.append({"title": title, "pane": pane, "fig": fig})
+def _add_to_gallery(title: str, fig_or_panel, roi_name: str = None) -> None:
+    """Add a matplotlib figure or a Panel component to the global gallery."""
+    if isinstance(fig_or_panel, pn.viewable.Viewable):
+        pane = fig_or_panel
+    else:
+        pane = pn.pane.Matplotlib(fig_or_panel, tight=True, sizing_mode="stretch_width", height=460)
+        plt.close(fig_or_panel)
+    plot_gallery.append({"title": title, "pane": pane, "fig": None, "roi_name": roi_name})
     _rebuild_gallery()
+    if roi_name and roi_name in roi_gallery_hooks:
+        roi_gallery_hooks[roi_name](title, fig_or_panel)
 
 
 def _rebuild_gallery():
@@ -371,42 +503,25 @@ for _w in [w_year, w_btid, w_beamline]:
     _w.param.watch(_update_path_preview, "value")
 _update_path_preview()
 
-w_scan_num  = pn.widgets.IntInput(name="Scan Number", value=1, step=1, width=140)
-w_detector  = pn.widgets.Select(name="Detector", options=["Eiger","Lambda"], value="Eiger", width=140)
-w_sample    = pn.widgets.TextInput(name="Sample Name", placeholder="e.g. SampleA_001", width=220)
-w_det_dist  = pn.widgets.FloatInput(name="Detector Distance (m)", value=2.0, step=0.05, width=200)
+w_scan_num   = pn.widgets.IntInput( name="Scan Number",            value=1,   step=1,   width=140)
+w_detector   = pn.widgets.Select(   name="Detector", options=["Eiger","Lambda"], value="Eiger", width=140)
+w_sample     = pn.widgets.TextInput(name="Sample Name",            placeholder="e.g. SampleA_001", width=220)
+w_det_dist   = pn.widgets.FloatInput(name="Detector Distance (m)", value=2.0, step=0.05, width=200)
+w_scan_label = pn.widgets.TextInput(name="Scan label",             placeholder="auto", width=160)
 btn_create_scan = pn.widgets.Button(name="Load Scan", button_type="primary", width=180, disabled=True)
-btn_clear_scan  = pn.widgets.Button(name="Clear", button_type="default", width=100)
-
-scan_info_html = pn.pane.HTML(
-    "<span style='color:var(--txt-muted);font-family:JetBrains Mono,monospace;"
-    "font-size:12px'>No scan loaded yet.</span>", sizing_mode="stretch_width",
-)
-
-file_table = pn.widgets.Tabulator(
-    value=None, pagination="local", page_size=12,
-    sizing_mode="stretch_width", height=260, theme="midnight",
-    stylesheets=[""":host .tabulator { background: var(--bg-dark); color: var(--txt);
-       font-family: 'JetBrains Mono', monospace; font-size: 12px; }"""],
-)
 
 _SCAN_STAT_LABELS = ["Scan #", "Files", "Energy (keV)", "Step X (nm)", "Step Y (nm)", "Points X×Y"]
-stats_html = pn.pane.HTML(
-    "<div class='stat-grid'>"
-    + "".join(f"<div class='stat-chip'><div class='val'>—</div><div class='lbl'>{l}</div></div>"
-              for l in _SCAN_STAT_LABELS)
-    + "</div>", sizing_mode="stretch_width",
-)
+loaded_scans_col = pn.Column(sizing_mode="stretch_width")
 
 
-def _update_scan_stats(scan):
+def _make_stats_html(scan) -> str:
     n_files = len(getattr(scan, "file_list", []) or [])
     energy  = getattr(scan, "energy", None)
     sx = getattr(scan, "step_size_x", None)
     sy = getattr(scan, "step_size_y", None)
     px = getattr(scan, "scan_x_steps_count", None)
     py = getattr(scan, "scan_y_steps_count", None)
-    stats_html.object = (
+    return (
         "<div class='stat-grid'>"
         f"<div class='stat-chip'><div class='val'>{scan.scan_num}</div><div class='lbl'>Scan #</div></div>"
         f"<div class='stat-chip'><div class='val'>{n_files}</div><div class='lbl'>Files</div></div>"
@@ -418,13 +533,20 @@ def _update_scan_stats(scan):
     )
 
 
-def _reset_scan_stats():
-    stats_html.object = (
-        "<div class='stat-grid'>"
-        + "".join(f"<div class='stat-chip'><div class='val'>—</div><div class='lbl'>{l}</div></div>"
-                  for l in _SCAN_STAT_LABELS)
-        + "</div>"
-    )
+def _rebuild_loaded_scans():
+    loaded_scans_col.clear()
+    if not state["scans"]:
+        loaded_scans_col.append(pn.pane.HTML(
+            "<span style='color:var(--txt-muted);font-family:JetBrains Mono,monospace;font-size:12px'>"
+            "No scans loaded yet.</span>"))
+        return
+    for lbl in state["scans"]:
+        loaded_scans_col.append(pn.pane.HTML(
+            f"<span style='font-family:JetBrains Mono,monospace;font-size:12px;"
+            f"color:var(--accent)'>● {lbl}</span> "
+            f"<span style='color:var(--txt-muted);font-size:11px'>"
+            f"({len(state['scans'][lbl].file_list)} files)</span>",
+            sizing_mode="stretch_width"))
 
 
 def on_create_exp(event):
@@ -453,51 +575,29 @@ def on_create_scan(event):
     det    = w_detector.value
     sample = w_sample.value.strip() or None
     ddist  = w_det_dist.value
-    log(f"Loading Scan {snum} (det={det}, dist={ddist} m)…", "info")
+    label  = w_scan_label.value.strip() or f"scan_{snum}"
+    if label in state["scans"]:
+        log(f"Scan label '{label}' already in use.", "err")
+        pn.state.notifications.error(f"Label '{label}' already loaded.", duration=3000); return
+    log(f"Loading Scan {snum} (det={det}, dist={ddist} m, label='{label}')…", "info")
     try:
         from ptyxplore.cbd_loader import Scan
-        state["scan"] = Scan(exp=state["exp"], scan_num=snum,
-                             detector=det, sample_name=sample, det_distance=ddist)
-        scan = state["scan"]
-        log(f"Scan {snum} loaded ✓  ({len(scan.file_list)} files found)", "ok")
+        scan = Scan(exp=state["exp"], scan_num=snum,
+                    detector=det, sample_name=sample, det_distance=ddist)
+        state["scans"][label] = scan
+        _refresh_scan_select()
+        _rebuild_loaded_scans()
+        tabs.append((f"Scan {scan.scan_num}", _make_scan_tab(label)))
+        log(f"Scan '{label}' loaded ✓  ({len(scan.file_list)} files)", "ok")
         _set_status(True)
-        scan_info_html.object = (
-            f"<div style='font-family:JetBrains Mono,monospace;font-size:12px;line-height:1.9'>"
-            f"<span style='color:var(--txt-muted)'>data_dir  :</span> <span style='color:var(--txt)'>{scan.data_dir}</span><br>"
-            f"<span style='color:var(--txt-muted)'>slow_axis :</span> <span style='color:{ACCENT2}'>{scan.slow_axis}</span><br>"
-            f"<span style='color:var(--txt-muted)'>wavelength:</span> <span style='color:{ACCENT}'>{scan.wavelength*10:.4f} Å</span>"
-            f"&nbsp;&nbsp;<span style='color:var(--txt-muted)'>energy:</span> <span style='color:{ACCENT}'>{scan.energy:.4f} keV</span><br>"
-            f"<span style='color:var(--txt-muted)'>det psize :</span> <span style='color:var(--txt)'>{scan.det_psize*1e-3:.0f} µm</span>"
-            f"</div>"
-        )
-        import pandas as pd
-        file_table.value = pd.DataFrame([{"#": i+1, "File": f} for i, f in enumerate(scan.file_list)])
-        _update_scan_stats(scan)
-        n = len(scan.file_list)
-        w_file_idx.end   = max(0, n - 1)
-        w_file_idx.value = 0
-        pn.state.notifications.success(f"Scan {snum} loaded!", duration=3000)
+        pn.state.notifications.success(f"Scan '{label}' loaded!", duration=3000)
     except Exception as exc:
         log(f"Failed to load Scan: {exc}", "err"); _set_status(False)
         pn.state.notifications.error(str(exc), duration=5000)
 
 
-def on_clear_scan(event):
-    state["scan"] = None
-    state["current_frame"] = state["processed_frame"] = None
-    scan_info_html.object = (
-        "<span style='color:var(--txt-muted);font-family:JetBrains Mono,monospace;"
-        "font-size:12px'>No scan loaded yet.</span>")
-    file_table.value = None
-    _reset_scan_stats(); _set_status(None)
-    log("Scan cleared.", "warn")
-    w_file_idx.end = w_file_idx.value = 0
-    w_frame_idx.end = w_frame_idx.value = 0
-
-
 btn_create_exp.on_click(on_create_exp)
 btn_create_scan.on_click(on_create_scan)
-btn_clear_scan.on_click(on_clear_scan)
 
 tab_loading = pn.Column(
     pn.Column(
@@ -508,17 +608,16 @@ tab_loading = pn.Column(
         sizing_mode="stretch_width", css_classes=["ptycho-card"], margin=(0, 0, 16, 0),
     ),
     pn.Column(
-        pn.pane.HTML("<p class='section-label'>02 — Scan</p>", sizing_mode="stretch_width"),
+        pn.pane.HTML("<p class='section-label'>02 — Load Scan</p>", sizing_mode="stretch_width"),
         pn.Row(w_scan_num, w_detector, w_sample, w_det_dist, align="end"),
-        pn.Row(btn_create_scan, btn_clear_scan, align="center"),
-        pn.pane.HTML("<hr class='divider'>", sizing_mode="stretch_width"),
-        scan_info_html, stats_html,
+        pn.Row(w_scan_label, align="end"),
+        pn.Row(btn_create_scan),
         sizing_mode="stretch_width", css_classes=["ptycho-card"], margin=(0, 0, 16, 0),
     ),
     pn.Column(
-        pn.pane.HTML("<p class='section-label'>03 — Detector Files</p>", sizing_mode="stretch_width"),
-        file_table,
-        sizing_mode="stretch_width", css_classes=["ptycho-card"], margin=(0, 0, 0, 0),
+        pn.pane.HTML("<p class='section-label'>03 — Loaded Scans</p>", sizing_mode="stretch_width"),
+        loaded_scans_col,
+        sizing_mode="stretch_width", css_classes=["ptycho-card"],
     ),
     sizing_mode="stretch_width", margin=(16, 0),
 )
@@ -528,6 +627,7 @@ tab_loading = pn.Column(
 #  TAB 2 — ROI MANAGER
 # ═══════════════════════════════════════════════════════════════════════════════
 
+w_roi_scan = pn.widgets.Select(name="Scan", options=["— none —"], value="— none —", width=200)
 w_roi_name = pn.widgets.TextInput(name="ROI name", placeholder="e.g. bragg_001", width=180)
 w_roi_kind = pn.widgets.Select(name="Kind", options=["Bragg", "Pupil"], value="Bragg", width=120)
 w_roi_rs   = pn.widgets.IntInput(name="row start", value=0,   width=110)
@@ -537,6 +637,14 @@ w_roi_ce   = pn.widgets.IntInput(name="col end",   value=100, width=110)
 w_roi_cx   = pn.widgets.FloatInput(name="centre px row", value=0.0, width=140)
 w_roi_cy   = pn.widgets.FloatInput(name="centre px col", value=0.0, width=140)
 btn_add_roi = pn.widgets.Button(name="Add ROI", button_type="primary", width=140)
+
+
+def _refresh_scan_select():
+    names = list(state["scans"].keys())
+    opts  = names if names else ["— none —"]
+    w_roi_scan.options = opts
+    if w_roi_scan.value not in names:
+        w_roi_scan.value = names[0] if names else "— none —"
 
 roi_cards_col = pn.Column(sizing_mode="stretch_width")
 _roi_placeholder = pn.pane.HTML(
@@ -590,6 +698,10 @@ def _make_roi_card(name: str) -> pn.Column:
             state["roi_history"].pop(name, None)
             if state["pupil_name"] == name:
                 state["pupil_name"] = None
+            roi_4dv_hooks.pop(name, None)
+            roi_gallery_hooks.pop(name, None)
+            # Tab title format is "{scan_label}: {roi_name}" — remove any tab ending with ": {name}"
+            tabs.objects = [(n, obj) for n, obj in tabs.objects if not n.endswith(f": {name}")]
             log(f"ROI '{name}' removed.", "warn")
             _rebuild_roi_cards()
             _refresh_pipe_roi_select()
@@ -610,9 +722,11 @@ def _rebuild_roi_cards():
 
 
 def on_add_roi(event):
-    if state["scan"] is None:
-        log("Load a scan first.", "warn")
-        pn.state.notifications.warning("Load a scan first.", duration=3000); return
+    scan_label = w_roi_scan.value
+    if scan_label == "— none —" or scan_label not in state["scans"]:
+        log("Select a loaded scan first.", "warn")
+        pn.state.notifications.warning("Select a scan first.", duration=3000); return
+    scan = state["scans"][scan_label]
     name = w_roi_name.value.strip()
     if not name:
         log("ROI name is required.", "err")
@@ -625,13 +739,14 @@ def on_add_roi(event):
     centre = [w_roi_cx.value, w_roi_cy.value]
     try:
         from ptyxplore.cbd_loader import ROI
-        roi = ROI(scan=state["scan"], kind=kind, coords=coords, centre_pixel=centre)
+        roi = ROI(scan=scan, kind=kind, coords=coords, centre_pixel=centre)
         state["rois"][name] = roi
         state["roi_history"][name] = [f"[{ts()}] Created ({kind}, coords={coords})"]
         if kind == "pupil" and state["pupil_name"] is None:
             state["pupil_name"] = name
         _rebuild_roi_cards()
         _refresh_pipe_roi_select()
+        tabs.append((f"{scan_label}: {name}", _make_roi_tab(name)))
         log(f"ROI '{name}' created ✓", "ok")
         pn.state.notifications.success(f"ROI '{name}' added!", duration=2000)
     except Exception as exc:
@@ -644,6 +759,7 @@ btn_add_roi.on_click(on_add_roi)
 tab_roi_manager = pn.Column(
     pn.Column(
         pn.pane.HTML("<p class='section-label'>Add ROI</p>", sizing_mode="stretch_width"),
+        pn.Row(w_roi_scan, align="end"),
         pn.Row(w_roi_name, w_roi_kind, align="end"),
         pn.pane.HTML("<span style='color:var(--txt-muted);font-family:JetBrains Mono,monospace;"
                      "font-size:11px'>Detector coords (pixels)</span>"),
@@ -835,22 +951,29 @@ def _refresh_pipe_roi_select():
     w_4dv_roi.options = opts
     if w_4dv_roi.value not in names:
         w_4dv_roi.value = names[0] if names else "— none —"
+    _refresh_scan_select()
 
 
-def _rebuild_queue():
-    queue_col.clear()
-    if not pipeline_queue:
-        queue_col.append(pn.pane.HTML(
+def _rebuild_queue(queue=None, col=None):
+    if queue is None:
+        queue = pipeline_queue
+    if col is None:
+        col = queue_col
+    col.clear()
+    if not queue:
+        col.append(pn.pane.HTML(
             "<span style='color:var(--txt-muted);font-family:JetBrains Mono,monospace;font-size:12px'>"
             "Queue is empty. Add steps above.</span>"))
         return
-    for i, item in enumerate(pipeline_queue):
-        cls = {"pending":"badge-idle","running":"badge-run","done":"badge-ok","error":"badge-err"}.get(item["status"],"badge-idle")
-        pstr = ", ".join(f"{k}={v}" for k, v in item["params"].items())
+    for i, item in enumerate(queue):
+        cls     = {"pending":"badge-idle","running":"badge-run","done":"badge-ok","error":"badge-err"}.get(item["status"],"badge-idle")
+        enabled = item.get("enabled", True)
+        opacity = "1.0" if enabled else "0.4"
+        pstr    = ", ".join(f"{k}={v}" for k, v in item["params"].items())
         if len(pstr) > 55:
             pstr = pstr[:55] + "…"
         row_html = pn.pane.HTML(
-            f"<div class='queue-row'>"
+            f"<div class='queue-row' style='opacity:{opacity}'>"
             f"<span class='q-idx'>#{i+1}</span>"
             f"<span class='q-op'>{item['op']}</span>"
             f"<span class='q-roi'>{item['roi_name'] or '—'}</span>"
@@ -858,16 +981,47 @@ def _rebuild_queue():
             f"<span><span class='badge {cls}'>{item['status'].upper()}</span></span>"
             f"</div>", sizing_mode="stretch_width")
 
-        def _make_rm(idx=i):
-            btn = pn.widgets.Button(name="✕", button_type="default", width=36)
+        def _make_toggle(idx=i, q=queue, c=col):
+            cb = pn.widgets.Checkbox(name="", value=q[idx].get("enabled", True), width=20, margin=(8, 4))
+            def _toggle(event):
+                q[idx]["enabled"] = event.new
+                _rebuild_queue(q, c)
+            cb.param.watch(_toggle, "value")
+            return cb
+
+        def _make_up(idx=i, q=queue, c=col):
+            btn = pn.widgets.Button(name="▲", width=32, height=30, margin=(4, 1),
+                                    disabled=(idx == 0))
+            def _up(event):
+                if idx > 0:
+                    q[idx - 1], q[idx] = q[idx], q[idx - 1]
+                    _rebuild_queue(q, c)
+            btn.on_click(_up)
+            return btn
+
+        def _make_down(idx=i, q=queue, c=col):
+            btn = pn.widgets.Button(name="▼", width=32, height=30, margin=(4, 1),
+                                    disabled=(idx == len(q) - 1))
+            def _down(event):
+                if idx < len(q) - 1:
+                    q[idx + 1], q[idx] = q[idx], q[idx + 1]
+                    _rebuild_queue(q, c)
+            btn.on_click(_down)
+            return btn
+
+        def _make_rm(idx=i, q=queue, c=col):
+            btn = pn.widgets.Button(name="✕", button_type="default", width=36, height=30, margin=(4, 2))
             def _rm(event):
-                if idx < len(pipeline_queue):
-                    pipeline_queue.pop(idx)
-                    _rebuild_queue()
+                if idx < len(q):
+                    q.pop(idx)
+                    _rebuild_queue(q, c)
             btn.on_click(_rm)
             return btn
 
-        queue_col.append(pn.Row(row_html, _make_rm(), align="center", sizing_mode="stretch_width"))
+        col.append(pn.Row(
+            _make_toggle(), _make_up(), _make_down(),
+            row_html, _make_rm(),
+            align="center", sizing_mode="stretch_width"))
 
 
 def on_pipe_add(event):
@@ -877,7 +1031,7 @@ def on_pipe_add(event):
         log("Select a target ROI for this operation.", "warn")
         pn.state.notifications.warning("Select a target ROI.", duration=3000); return
     pipeline_queue.append({"op": op, "roi_name": roi_name,
-                           "params": _snapshot_params(op), "status": "pending"})
+                           "params": _snapshot_params(op), "status": "pending", "enabled": True})
     _rebuild_queue()
     log(f"Queued: {op} → {roi_name or 'scan'}", "info")
 
@@ -887,7 +1041,7 @@ def _execute_step(item: dict) -> None:
     roi_name = item["roi_name"]
     params   = item["params"]
     roi      = state["rois"].get(roi_name) if roi_name else None
-    scan     = state["scan"]
+    scan     = roi.scan if roi else None
     pupil    = state["rois"].get(state["pupil_name"]) if state["pupil_name"] else None
 
     from ptyxplore import roi_ops
@@ -901,6 +1055,8 @@ def _execute_step(item: dict) -> None:
         _add_roi_history(roi_name, f"Make 4D dataset → shape={roi.data_4d.shape}")
         if w_4dv_roi.value == roi_name:
             _on_4dv_roi_change(type('_', (), {'new': roi_name})())
+        if roi_name in roi_4dv_hooks:
+            roi_4dv_hooks[roi_name]()
     elif op == "Pool detector":
         roi_ops.pool_detector(roi, params["kernel_size"], params["stride"], params["padding"])
         _add_roi_history(roi_name, f"Pool detector → {roi.data_4d.shape}")
@@ -947,25 +1103,52 @@ def _execute_step(item: dict) -> None:
     elif op == "Plot: Average detector":
         if roi.averaged_det_images is None:
             raise ValueError("Run Make 4D dataset first.")
-        fig = _make_image_fig(roi.averaged_det_images, f"Avg Detector — {roi_name}",
-                              params["log_scale"], params["cmap"], params["vmin"], params["vmax"])
-        _add_to_gallery(f"Average Detector — {roi_name}", fig)
+        panel = _make_bk_image_panel(
+            roi.averaged_det_images, f"Avg Detector — {roi_name}",
+            params["log_scale"], params["cmap"], params["vmin"], params["vmax"])
+        _add_to_gallery(f"Average Detector — {roi_name}", panel, roi_name=roi_name)
         _add_roi_history(roi_name, "Plot: Average detector → gallery")
     elif op == "Plot: Averaged coherent":
         if roi.averaged_coherent_images is None:
             raise ValueError("averaged_coherent_images not available.")
-        fig = _make_image_fig(roi.averaged_coherent_images, f"Avg Coherent — {roi_name}",
-                              params["log_scale"], params["cmap"], params["vmin"], params["vmax"])
-        _add_to_gallery(f"Averaged Coherent — {roi_name}", fig)
+        panel = _make_bk_image_panel(
+            roi.averaged_coherent_images, f"Avg Coherent — {roi_name}",
+            params["log_scale"], params["cmap"], params["vmin"], params["vmax"])
+        _add_to_gallery(f"Averaged Coherent — {roi_name}", panel, roi_name=roi_name)
         _add_roi_history(roi_name, "Plot: Averaged coherent → gallery")
     elif op == "Plot: Coherent sequence":
         if roi.coherent_imgs is None:
             raise ValueError("coherent_imgs not available.")
-        for idx_img, img in enumerate(roi.coherent_imgs):
-            fig = _make_image_fig(img, f"Coherent [{idx_img}] — {roi_name}",
-                                  params["log_scale"], params["cmap"], params["vmin"], params["vmax"])
-            _add_to_gallery(f"Coherent [{idx_img}] — {roi_name}", fig)
-        _add_roi_history(roi_name, f"Plot: Coherent sequence → {len(roi.coherent_imgs)} frames to gallery")
+        imgs = roi.coherent_imgs
+        n = len(imgs)
+        # Build a slider-based viewer as a single gallery item (avoids opening n figures)
+        w_seq  = pn.widgets.IntSlider(name="Frame index", start=0, end=n - 1, value=0, width=320)
+        info_h = pn.pane.HTML(
+            f"<span style='font-family:JetBrains Mono,monospace;font-size:11px;"
+            f"color:var(--accent2)'>{n} frames — use slider to browse</span>")
+        _init_fig = _make_image_fig(imgs[0], f"Coherent [0/{n-1}] — {roi_name}",
+                                    params["log_scale"], params["cmap"],
+                                    params["vmin"], params["vmax"])
+        seq_pane   = pn.pane.Matplotlib(_init_fig, tight=True,
+                                        sizing_mode="stretch_width", height=440)
+        plt.close(_init_fig)
+        _seq_fc = [None]
+
+        def _upd_seq(event, _imgs=imgs, _rn=roi_name, _p=params):
+            idx = w_seq.value
+            if _seq_fc[0] is not None:
+                plt.close(_seq_fc[0])
+            fig = _make_image_fig(_imgs[idx], f"Coherent [{idx}/{len(_imgs)-1}] — {_rn}",
+                                  _p["log_scale"], _p["cmap"], _p["vmin"], _p["vmax"])
+            _seq_fc[0] = fig
+            seq_pane.object = fig
+            plt.close(fig)
+
+        w_seq.param.watch(_upd_seq, "value")
+        seq_component = pn.Column(info_h, w_seq, seq_pane, sizing_mode="stretch_width")
+        _add_to_gallery(f"Coherent sequence ({n} frames) — {roi_name}",
+                        seq_component, roi_name=roi_name)
+        _add_roi_history(roi_name, f"Plot: Coherent sequence → {n} frames (slider viewer)")
     elif op == "Plot: 4D viewer (single)":
         if roi.data_4d is None:
             raise ValueError("Run Make 4D dataset first.")
@@ -974,15 +1157,17 @@ def _execute_step(item: dict) -> None:
         coh = make_coherent_image(roi.data_4d, np.array([px, py]))
         det = make_detector_image(roi.data_4d, np.array([0, 0]))
         _add_to_gallery(f"4D Coherent px=({px},{py}) — {roi_name}",
-                        _make_image_fig(coh, f"Coherent px=({px},{py})", params["log_scale"], "plasma", None, None, (5,4)))
+                        _make_bk_image_panel(coh, f"Coherent px=({px},{py})", params["log_scale"], "plasma"),
+                        roi_name=roi_name)
         _add_to_gallery(f"4D Detector — {roi_name}",
-                        _make_image_fig(det, f"Detector", params["log_scale"], params["cmap"], None, None, (5,4)))
+                        _make_bk_image_panel(det, f"Detector", params["log_scale"], params["cmap"]),
+                        roi_name=roi_name)
         _add_roi_history(roi_name, f"Plot: 4D viewer (px={px},{py}) → gallery")
     elif op == "Plot: K-outs":
         if roi.averaged_det_images is None or roi.kout_coords is None:
             raise ValueError("Compute k-outs first.")
         fig = _make_kcoord_fig(roi.averaged_det_images, roi.kout_coords, roi.coords, params["cmap"], f"K-outs — {roi_name}")
-        _add_to_gallery(f"K-outs — {roi_name}", fig)
+        _add_to_gallery(f"K-outs — {roi_name}", fig, roi_name=roi_name)
         _add_roi_history(roi_name, "Plot: K-outs → gallery")
     elif op == "Plot: K-ins":
         if pupil is None or pupil.averaged_det_images is None:
@@ -990,7 +1175,7 @@ def _execute_step(item: dict) -> None:
         if roi.kin_coords is None:
             raise ValueError("Compute kins first.")
         fig = _make_kcoord_fig(pupil.averaged_det_images, roi.kin_coords, pupil.coords, params["cmap"], f"K-ins — {roi_name}")
-        _add_to_gallery(f"K-ins — {roi_name}", fig)
+        _add_to_gallery(f"K-ins — {roi_name}", fig, roi_name=roi_name)
         _add_roi_history(roi_name, "Plot: K-ins → gallery")
     elif op == "Save: ROI data (HDF5)":
         outdir = params["save_dir"]
@@ -1020,26 +1205,74 @@ def _execute_step(item: dict) -> None:
         log(f"Frame saved → {path}", "ok")
 
 
-def on_pipe_run(event):
-    pending = [i for i, it in enumerate(pipeline_queue) if it["status"] == "pending"]
+def _run_queue(queue, queue_col_ref, label, btn_run, btn_stop, btn_clear=None):
+    """
+    Execute a pipeline queue in a background thread.
+    Checks _stop_event between each step so the Stop button can interrupt.
+    All UI updates are dispatched via pn.state.execute (thread-safe).
+    """
+    pending = [i for i, it in enumerate(queue)
+               if it["status"] == "pending" and it.get("enabled", True)]
     if not pending:
-        log("No pending items in queue.", "warn")
-        pn.state.notifications.warning("No pending items.", duration=2000); return
-    for i in pending:
-        item = pipeline_queue[i]
-        item["status"] = "running"
-        _rebuild_queue()
+        log(f"[{label}] No pending items.", "warn")
+        pn.state.notifications.warning("No pending items.", duration=2000)
+        return
+
+    _stop_event.clear()
+    btn_run.disabled  = True
+    btn_stop.disabled = False
+    if btn_clear:
+        btn_clear.disabled = True
+
+    def _work():
         try:
-            _execute_step(item)
-            item["status"] = "done"
-            log(f"✓ [{i+1}] {item['op']}", "ok")
-        except Exception as exc:
-            item["status"] = "error"
-            log(f"✗ [{i+1}] {item['op']}: {exc}", "err")
-            pn.state.notifications.error(f"Step {i+1} failed: {exc}", duration=6000)
-        _rebuild_queue()
-    _rebuild_roi_cards()
-    pn.state.notifications.success("Pipeline run complete.", duration=3000)
+            for i in pending:
+                if _stop_event.is_set():
+                    pn.state.execute(lambda: log(f"[{label}] Stopped by user.", "warn"))
+                    break
+                item = queue[i]
+                item["status"] = "running"
+                pn.state.execute(lambda: _rebuild_queue(queue, queue_col_ref))
+                try:
+                    _execute_step(item)
+                    item["status"] = "done"
+                    def _ok(idx=i, op=item["op"]):
+                        log(f"[{label}] ✓ [{idx+1}] {op}", "ok")
+                    pn.state.execute(_ok)
+                except Exception as exc:
+                    item["status"] = "error"
+                    def _err(idx=i, op=item["op"], e=str(exc)):
+                        log(f"[{label}] ✗ [{idx+1}] {op}: {e}", "err")
+                        pn.state.notifications.error(f"{op} failed: {e}", duration=6000)
+                    pn.state.execute(_err)
+                pn.state.execute(lambda: _rebuild_queue(queue, queue_col_ref))
+        finally:
+            def _cleanup():
+                _rebuild_roi_cards()
+                btn_run.disabled  = False
+                btn_stop.disabled = True
+                if btn_clear:
+                    btn_clear.disabled = False
+                if not _stop_event.is_set():
+                    pn.state.notifications.success(f"[{label}] Run complete.", duration=3000)
+            pn.state.execute(_cleanup)
+
+    threading.Thread(target=_work, daemon=True).start()
+
+
+btn_pipe_stop = pn.widgets.Button(name="⏹  Stop", button_type="danger", width=120, disabled=True)
+
+
+def on_pipe_run(event):
+    if not btn_pipe_run.disabled:  # guard against double-click while starting
+        _run_queue(pipeline_queue, queue_col, "global",
+                   btn_pipe_run, btn_pipe_stop, btn_pipe_clear)
+
+
+def on_pipe_stop(event):
+    _stop_event.set()
+    log("Stop requested — will halt after the current step finishes.", "warn")
+    btn_pipe_stop.disabled = True
 
 
 def on_pipe_clear(event):
@@ -1050,8 +1283,10 @@ def on_pipe_clear(event):
 
 btn_pipe_add.on_click(on_pipe_add)
 btn_pipe_run.on_click(on_pipe_run)
+btn_pipe_stop.on_click(on_pipe_stop)
 btn_pipe_clear.on_click(on_pipe_clear)
 _rebuild_queue()
+_rebuild_loaded_scans()
 
 tab_pipeline = pn.Column(
     pn.Column(
@@ -1065,7 +1300,7 @@ tab_pipeline = pn.Column(
         pn.pane.HTML("<p class='section-label'>Queue</p>", sizing_mode="stretch_width"),
         queue_col,
         pn.pane.HTML("<hr class='divider'>", sizing_mode="stretch_width"),
-        pn.Row(btn_pipe_run, btn_pipe_clear),
+        pn.Row(btn_pipe_run, btn_pipe_stop, btn_pipe_clear),
         sizing_mode="stretch_width", css_classes=["ptycho-card"],
     ),
     sizing_mode="stretch_width", margin=(16, 0),
@@ -1078,7 +1313,8 @@ tab_pipeline = pn.Column(
 
 w_file_idx  = pn.widgets.IntSlider(name="File index",  start=0, end=0, value=0, width=320)
 w_frame_idx = pn.widgets.IntSlider(name="Frame index", start=0, end=0, value=0, width=320)
-w_log_scale = pn.widgets.Checkbox(name="Log scale", value=True)
+w_log_scale     = pn.widgets.Checkbox(name="Log scale",        value=True)
+w_mask_hot      = pn.widgets.Checkbox(name="Mask hot pixels",  value=True)
 w_cmap_vis  = pn.widgets.Select(
     name="Colormap", options=["viridis","jet","plasma","inferno","gray","hot","turbo"], value="viridis", width=140)
 w_vmin_vis  = pn.widgets.FloatInput(name="vmin (blank=auto)", width=160)
@@ -1115,7 +1351,10 @@ def on_load_frame(event):
         w_frame_idx.end = max(0, n_frames - 1)
         if fridx >= n_frames:
             w_frame_idx.value = 0; fridx = 0
-        state["current_frame"]   = frame.copy()
+        state["current_frame"] = frame.copy()
+        if w_mask_hot.value:
+            from ptyxplore.data_proc import mask_hot_pixels
+            frame = mask_hot_pixels(frame)
         state["processed_frame"] = frame.copy()
         fig = _make_image_fig(frame,
             f"File {fidx+1}/{len(scan.file_list)} · Frame {fridx}/{n_frames-1}",
@@ -1143,7 +1382,10 @@ def on_avg_frame(event):
     try:
         with h5py.File(fpath, "r") as f:
             avg = f["/entry/data/data"][...].mean(axis=0)
-        state["current_frame"]   = avg.copy()
+        state["current_frame"] = avg.copy()
+        if w_mask_hot.value:
+            from ptyxplore.data_proc import mask_hot_pixels
+            avg = mask_hot_pixels(avg)
         state["processed_frame"] = avg.copy()
         fig = _make_image_fig(avg, f"Average — File {fidx+1}/{len(scan.file_list)}",
                               w_log_scale.value, w_cmap_vis.value,
@@ -1250,7 +1492,7 @@ tab_vis = pn.Column(
     pn.Column(
         pn.pane.HTML("<p class='section-label'>Frame Browser</p>", sizing_mode="stretch_width"),
         pn.Row(w_file_idx, w_frame_idx),
-        pn.Row(w_log_scale, w_cmap_vis, w_vmin_vis, w_vmax_vis, align="end"),
+        pn.Row(w_log_scale, w_mask_hot, w_cmap_vis, w_vmin_vis, w_vmax_vis, align="end"),
         pn.Row(btn_load_frame, btn_avg_frame),
         vis_pane, vis_info,
         sizing_mode="stretch_width", css_classes=["ptycho-card"], margin=(0, 0, 16, 0),
@@ -1279,13 +1521,19 @@ tab_vis = pn.Column(
 
 _CONSOLE_PRELUDE = """\
 # Available in this namespace:
-#   state          — dict with keys: rois, scan, exp, current_frame, roi_history
-#   state['rois']  — dict of name → ROI objects
-#   np, plt, pn    — numpy, matplotlib.pyplot, panel
+#   state           — dict: rois, scans, exp, current_frame, roi_history
+#   state['rois']   — dict of name → ROI objects
+#   state['scans']  — dict of label → Scan objects
+#   np, plt, pn     — numpy, matplotlib.pyplot, panel
+#   roi_ops         — ptyxplore.roi_ops module
+#   data_proc       — ptyxplore.data_proc module
+#   data_io         — ptyxplore.data_io module
+#   cbd_loader      — ptyxplore.cbd_loader module (Exp, Scan, ROI classes)
 #
 # Example:
 #   roi = state['rois']['bragg_001']
 #   print(roi.data_4d.shape)
+#   cbd_loader.ROI?
 """
 
 console_editor = pn.widgets.CodeEditor(
@@ -1308,7 +1556,17 @@ def on_console_run(event):
     code = console_editor.value
     if not code.strip():
         return
-    _console_ns.update({"state": state, "np": np, "plt": plt, "pn": pn})
+    try:
+        from ptyxplore import roi_ops, data_proc, data_io
+        import ptyxplore.cbd_loader as cbd_loader
+    except Exception:
+        roi_ops = data_proc = data_io = cbd_loader = None
+    _console_ns.update({
+        "state": state, "np": np, "plt": plt, "pn": pn,
+        "roi_ops": roi_ops, "data_proc": data_proc,
+        "data_io": data_io, "cbd_loader": cbd_loader,
+        "h5py": h5py, "os": os,
+    })
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf):
@@ -1359,15 +1617,732 @@ tab_python = pn.Column(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  Per-scan tab factory
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _make_scan_tab(scan_label: str) -> pn.Column:
+    """Return a tab with scan info, Bokeh Frame Browser, and ROI creation from selection."""
+    scan = state["scans"][scan_label]
+    import pandas as pd
+    from bokeh.models import (
+        ColumnDataSource, LinearColorMapper, ColorBar,
+        HoverTool, CustomJS, BasicTicker,
+    )
+    from bokeh.plotting import figure as bk_figure
+
+    # ── Scan info ─────────────────────────────────────────────────────────────
+    info_html = pn.pane.HTML(
+        f"<div style='font-family:JetBrains Mono,monospace;font-size:12px;line-height:1.9'>"
+        f"<span style='color:var(--txt-muted)'>data_dir  :</span> <span style='color:var(--txt)'>{scan.data_dir}</span><br>"
+        f"<span style='color:var(--txt-muted)'>slow_axis :</span> <span style='color:{ACCENT2}'>{scan.slow_axis}</span><br>"
+        f"<span style='color:var(--txt-muted)'>wavelength:</span> <span style='color:{ACCENT}'>{scan.wavelength*10:.4f} Å</span>"
+        f"&nbsp;&nbsp;<span style='color:var(--txt-muted)'>energy:</span> <span style='color:{ACCENT}'>{scan.energy:.4f} keV</span><br>"
+        f"<span style='color:var(--txt-muted)'>det psize :</span> <span style='color:var(--txt)'>{scan.det_psize*1e-3:.0f} µm</span>"
+        f"</div>",
+        sizing_mode="stretch_width",
+    )
+    stats_pane = pn.pane.HTML(_make_stats_html(scan), sizing_mode="stretch_width")
+    ftable = pn.widgets.Tabulator(
+        value=pd.DataFrame([{"#": i+1, "File": f} for i, f in enumerate(scan.file_list)]),
+        pagination="local", page_size=10,
+        sizing_mode="stretch_width", height=240, theme="midnight",
+        stylesheets=[""":host .tabulator { background: var(--bg-dark); color: var(--txt);
+           font-family: 'JetBrains Mono', monospace; font-size: 12px; }"""],
+    )
+
+    # ── Bokeh Frame Browser ───────────────────────────────────────────────────
+    n_files  = len(scan.file_list)
+    s_file   = pn.widgets.IntSlider(name="File index",  start=0, end=max(0, n_files-1), value=0, width=280)
+    s_frame  = pn.widgets.IntSlider(name="Frame index", start=0, end=0, value=0, width=280)
+    cb_hot   = pn.widgets.Checkbox(name="Mask hot pixels", value=True)
+    cb_log   = pn.widgets.Checkbox(name="Log scale", value=False)
+    sel_cmap = pn.widgets.Select(
+        name="Colormap", options=["viridis","jet","plasma","inferno","gray","hot","turbo"],
+        value="viridis", width=130)
+    fi_vmin    = pn.widgets.FloatInput(name="vmin (blank=auto)", width=140)
+    fi_vmax    = pn.widgets.FloatInput(name="vmax (blank=auto)", width=140)
+    btn_auto   = pn.widgets.Button(name="Autoscale", button_type="default", width=100)
+    btn_load   = pn.widgets.Button(name="Load Frame",   button_type="primary", width=140)
+    btn_avg    = pn.widgets.Button(name="Show Average", button_type="default",  width=140)
+    fb_info    = pn.pane.HTML("", sizing_mode="stretch_width")
+    coord_info = pn.pane.HTML("", sizing_mode="stretch_width")
+
+    # Persistent Bokeh figure + data source
+    _blank   = np.zeros((64, 64), dtype=np.float32)
+    _bk_src  = ColumnDataSource({'image': [_blank], 'x': [0], 'y': [0], 'dw': [64], 'dh': [64]})
+    _bk_map  = LinearColorMapper(palette=_bk_palette("viridis"), low=0, high=1, nan_color='black')
+    _bk_fig  = bk_figure(
+        sizing_mode="stretch_width", height=480,
+        tools="pan,wheel_zoom,box_select,reset,tap",
+        active_scroll="wheel_zoom",
+        match_aspect=True,
+        background_fill_color=BG_DARK, border_fill_color=BG_MID,
+    )
+    _bk_fig.y_range.flipped = True
+    _bk_fig.image('image', 'x', 'y', 'dw', 'dh', source=_bk_src, color_mapper=_bk_map)
+    _bk_fig.add_tools(HoverTool(tooltips=[("col", "$x{0}"), ("row", "$y{0}"), ("val", "@image")]))
+    _bk_fig.add_layout(ColorBar(color_mapper=_bk_map, ticker=BasicTicker(), location=(0, 0)), 'right')
+
+    # JS → Python tracking for tap (cursor) and box-select (ROI)
+    _cur_src = ColumnDataSource({'x': [0.0], 'y': [0.0]})
+    _sel_src = ColumnDataSource({'x0': [0.0], 'y0': [0.0], 'x1': [0.0], 'y1': [0.0]})
+    _bk_fig.js_on_event('tap', CustomJS(args={'s': _cur_src}, code="""
+        s.data = {x: [cb_obj.x], y: [cb_obj.y]};  s.change.emit();
+    """))
+    _bk_fig.js_on_event('selectiongeometry', CustomJS(args={'s': _sel_src}, code="""
+        if (cb_obj.geometry && cb_obj.geometry.type === 'rect') {
+            const g = cb_obj.geometry;
+            s.data = {x0: [Math.min(g.x0,g.x1)], y0: [Math.min(g.y0,g.y1)],
+                      x1: [Math.max(g.x0,g.x1)], y1: [Math.max(g.y0,g.y1)]};
+            s.change.emit();
+        }
+    """))
+
+    _cursor = {'row': 0, 'col': 0}
+    _sel    = {'rs': 0, 're': 0, 'cs': 0, 'ce': 0}
+
+    def _fmt_coord():
+        coord_info.object = (
+            f"<span style='font-family:JetBrains Mono,monospace;font-size:11px;color:var(--txt-muted)'>"
+            f"cursor → row={_cursor['row']}, col={_cursor['col']}"
+            f" &nbsp;|&nbsp; box → row=[{_sel['rs']}, {_sel['re']}]"
+            f" col=[{_sel['cs']}, {_sel['ce']}]</span>")
+
+    def _on_cur(attr, old, new):
+        _cursor['col'] = max(0, int(new['x'][0]))
+        _cursor['row'] = max(0, int(new['y'][0]))
+        pn.state.execute(_fmt_coord)
+
+    def _on_sel(attr, old, new):
+        _sel['cs'] = max(0, int(new['x0'][0]))
+        _sel['ce'] = max(0, int(new['x1'][0]))
+        _sel['rs'] = max(0, int(new['y0'][0]))
+        _sel['re'] = max(0, int(new['y1'][0]))
+        pn.state.execute(_fmt_coord)
+
+    _cur_src.on_change('data', _on_cur)
+    _sel_src.on_change('data', _on_sel)
+
+    def _update_bk(frame_data):
+        h, w   = frame_data.shape
+        disp   = np.log1p(np.abs(frame_data.astype(float))) if cb_log.value else frame_data.astype(float)
+        lo     = fi_vmin.value if fi_vmin.value is not None else float(np.nanmin(disp))
+        hi     = fi_vmax.value if fi_vmax.value is not None else float(np.nanmax(disp))
+        if abs(hi - lo) < 1e-10:
+            hi = lo + 1.0
+        _bk_map.palette = _bk_palette(sel_cmap.value)
+        _bk_map.low  = lo
+        _bk_map.high = hi
+        _bk_src.data = {'image': [disp], 'x': [0], 'y': [0], 'dw': [w], 'dh': [h]}
+
+    def _on_autoscale(event):
+        if len(_bk_src.data['image']) and _bk_src.data['image'][0] is not None:
+            d = _bk_src.data['image'][0]
+            fi_vmin.value = fi_vmax.value = None
+            _bk_map.low  = float(d.min())
+            _bk_map.high = float(d.max())
+
+    def _on_vscale(event=None):
+        if len(_bk_src.data['image']) and _bk_src.data['image'][0] is not None:
+            d = _bk_src.data['image'][0]
+            _bk_map.low  = fi_vmin.value if fi_vmin.value is not None else float(d.min())
+            _bk_map.high = fi_vmax.value if fi_vmax.value is not None else float(d.max())
+
+    btn_auto.on_click(_on_autoscale)
+    fi_vmin.param.watch(_on_vscale, 'value')
+    fi_vmax.param.watch(_on_vscale, 'value')
+
+    def _load(event):
+        fidx  = s_file.value
+        fridx = s_frame.value
+        fpath = scan.file_list[fidx]
+        log(f"[{scan_label}] Loading file {fidx+1}/{n_files}, frame {fridx}…", "info")
+        try:
+            with h5py.File(fpath, "r") as f:
+                dset  = f["/entry/data/data"]
+                nfrm  = dset.shape[0]
+                frame = dset[min(fridx, nfrm - 1), :, :]
+            s_frame.end = max(0, nfrm - 1)
+            if cb_hot.value:
+                from ptyxplore.data_proc import mask_hot_pixels
+                frame = mask_hot_pixels(frame)
+            _update_bk(frame)
+            fb_info.object = (
+                f"<div style='font-family:JetBrains Mono,monospace;font-size:11px;"
+                f"color:var(--txt-muted);margin-top:6px'>"
+                f"shape: {frame.shape} &nbsp;|&nbsp; dtype: {frame.dtype} &nbsp;|&nbsp; "
+                f"min: {frame.min():.0f} &nbsp;|&nbsp; max: {frame.max():.0f} &nbsp;|&nbsp; "
+                f"mean: {frame.mean():.1f}</div>")
+            log(f"[{scan_label}] Frame loaded ✓", "ok")
+        except Exception as exc:
+            log(f"[{scan_label}] Failed to load frame: {exc}", "err")
+            pn.state.notifications.error(str(exc), duration=5000)
+
+    def _avg(event):
+        fidx  = s_file.value
+        fpath = scan.file_list[fidx]
+        log(f"[{scan_label}] Computing average of file {fidx+1}…", "info")
+        try:
+            with h5py.File(fpath, "r") as f:
+                avg = f["/entry/data/data"][...].mean(axis=0)
+            if cb_hot.value:
+                from ptyxplore.data_proc import mask_hot_pixels
+                avg = mask_hot_pixels(avg)
+            _update_bk(avg)
+            fb_info.object = (
+                f"<div style='font-family:JetBrains Mono,monospace;font-size:11px;"
+                f"color:var(--txt-muted);margin-top:6px'>"
+                f"shape: {avg.shape} &nbsp;|&nbsp; min: {avg.min():.1f} &nbsp;|&nbsp; "
+                f"max: {avg.max():.1f} &nbsp;|&nbsp; mean: {avg.mean():.2f}</div>")
+            log(f"[{scan_label}] Average computed ✓", "ok")
+        except Exception as exc:
+            log(f"[{scan_label}] Failed to compute average: {exc}", "err")
+            pn.state.notifications.error(str(exc), duration=5000)
+
+    btn_load.on_click(_load)
+    btn_avg.on_click(_avg)
+
+    # Log-point and log-ROI buttons ('p' / 'r' equivalents)
+    btn_log_pt  = pn.widgets.Button(name="Log Point [p]", button_type="default", width=120)
+    btn_log_roi = pn.widgets.Button(name="Log ROI [r]",   button_type="default", width=110)
+
+    def _log_pt(event):
+        log(f"[{scan_label}] Point → row={_cursor['row']}, col={_cursor['col']}", "info")
+
+    def _log_roi(event):
+        log(f"[{scan_label}] Selection → "
+            f"row=[{_sel['rs']}, {_sel['re']}], col=[{_sel['cs']}, {_sel['ce']}]", "info")
+
+    btn_log_pt.on_click(_log_pt)
+    btn_log_roi.on_click(_log_roi)
+
+    # ── Create ROI from box-selection ─────────────────────────────────────────
+    w_new_name = pn.widgets.TextInput(name="ROI name", placeholder="e.g. bragg_001", width=180)
+    w_new_kind = pn.widgets.Select(name="Kind", options=["Bragg", "Pupil"], value="Bragg", width=100)
+    btn_mk_roi = pn.widgets.Button(
+        name="Create ROI from Selection", button_type="success", width=220)
+
+    def _on_mk_roi(event):
+        name = w_new_name.value.strip()
+        kind = w_new_kind.value.lower()
+        coords = [_sel['rs'], _sel['re'], _sel['cs'], _sel['ce']]
+        if not name:
+            log("Enter a name for the new ROI.", "warn")
+            pn.state.notifications.warning("Enter ROI name.", duration=3000)
+            return
+        if name in state["rois"]:
+            log(f"ROI '{name}' already exists.", "err")
+            pn.state.notifications.error(f"Name '{name}' already in use.", duration=3000)
+            return
+        try:
+            from ptyxplore.cbd_loader import ROI
+            roi = ROI(scan=scan, kind=kind, coords=coords, centre_pixel=[0.0, 0.0])
+            state["rois"][name] = roi
+            state["roi_history"][name] = [
+                f"[{ts()}] Created from frame selection ({kind}, coords={coords})"]
+            if kind == "pupil" and state["pupil_name"] is None:
+                state["pupil_name"] = name
+            _rebuild_roi_cards()
+            _refresh_pipe_roi_select()
+            tabs.append((f"{scan_label}: {name}", _make_roi_tab(name)))
+            log(f"ROI '{name}' created from selection ✓  coords={coords}", "ok")
+            pn.state.notifications.success(f"ROI '{name}' added!", duration=2000)
+        except Exception as exc:
+            log(f"Failed to create ROI: {exc}", "err")
+            pn.state.notifications.error(str(exc), duration=5000)
+
+    btn_mk_roi.on_click(_on_mk_roi)
+
+    # ── Remove scan button ────────────────────────────────────────────────────
+    btn_remove = pn.widgets.Button(name="Remove Scan", button_type="danger", width=140)
+
+    def _remove(event):
+        if scan_label in state["scans"]:
+            del state["scans"][scan_label]
+            _refresh_scan_select()
+            _rebuild_loaded_scans()
+            scan_num = getattr(scan, "scan_num", scan_label)
+            tabs.objects = [
+                (n, obj) for n, obj in tabs.objects if n != f"Scan {scan_num}"
+            ]
+            log(f"Scan '{scan_label}' removed.", "warn")
+
+    btn_remove.on_click(_remove)
+
+    return pn.Column(
+        pn.Column(
+            pn.pane.HTML("<p class='section-label'>Scan Info</p>", sizing_mode="stretch_width"),
+            info_html, stats_pane,
+            pn.pane.HTML("<hr class='divider'>", sizing_mode="stretch_width"),
+            ftable,
+            pn.Row(btn_remove),
+            sizing_mode="stretch_width", css_classes=["ptycho-card"], margin=(0, 0, 16, 0),
+        ),
+        pn.Column(
+            pn.pane.HTML("<p class='section-label'>Frame Browser</p>", sizing_mode="stretch_width"),
+            pn.pane.HTML(
+                "<span style='font-family:JetBrains Mono,monospace;font-size:11px;"
+                "color:var(--txt-muted)'>Scroll to zoom · Pan · Box-select to mark ROI · "
+                "Tap then Log Point for coords</span>"),
+            pn.Row(s_file, s_frame),
+            pn.Row(cb_log, cb_hot, sel_cmap, align="end"),
+            pn.Row(fi_vmin, fi_vmax, btn_auto, align="end"),
+            pn.Row(btn_load, btn_avg),
+            _bk_fig,
+            pn.Row(btn_log_pt, btn_log_roi, coord_info, align="center"),
+            fb_info,
+            sizing_mode="stretch_width", css_classes=["ptycho-card"], margin=(0, 0, 16, 0),
+        ),
+        pn.Column(
+            pn.pane.HTML(
+                "<p class='section-label'>Create ROI from Selection</p>",
+                sizing_mode="stretch_width"),
+            pn.pane.HTML(
+                "<span style='font-family:JetBrains Mono,monospace;font-size:11px;"
+                "color:var(--txt-muted)'>Draw a box in the frame browser, enter a name, "
+                "then click Create.</span>"),
+            pn.Row(w_new_name, w_new_kind, align="end"),
+            pn.Row(btn_mk_roi),
+            sizing_mode="stretch_width", css_classes=["ptycho-card"],
+        ),
+        sizing_mode="stretch_width", margin=(16, 0),
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Per-ROI tab factory
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _make_roi_tab(roi_name: str) -> pn.Tabs:
+    """Return a pn.Tabs with Pipeline + Visualisation sub-tabs scoped to roi_name."""
+
+    # ── Fresh param widget instances (independent per ROI) ────────────────────
+    pw = {
+        "num_jobs":    pn.widgets.IntInput(  name="num_jobs",              value=32,  step=8,   width=130),
+        "kernel_size": pn.widgets.IntInput(  name="kernel_size",           value=2,   step=1,   width=130),
+        "stride":      pn.widgets.IntInput(  name="stride",                value=2,   step=1,   width=110),
+        "padding":     pn.widgets.IntInput(  name="padding",               value=0,             width=110),
+        "mask_val":    pn.widgets.FloatInput(name="mask_val",              value=1.0, step=0.1, width=130),
+        "region_rs":   pn.widgets.IntInput(  name="region row start",      value=0,   width=130),
+        "region_re":   pn.widgets.IntInput(  name="region row end",        value=10,  width=130),
+        "region_cs":   pn.widgets.IntInput(  name="region col start",      value=0,   width=130),
+        "region_ce":   pn.widgets.IntInput(  name="region col end",        value=10,  width=130),
+        "region_mode": pn.widgets.Select(    name="mode", options=["zeros","median","ones"], value="median", width=120),
+        "est_ttheta":  pn.widgets.FloatInput(name="est_ttheta (deg)",      value=1.0, step=0.1, width=160),
+        "method":      pn.widgets.Select(    name="method", options=["BFGS","L-BFGS-B","Nelder-Mead"], value="BFGS", width=150),
+        "gtol":        pn.widgets.FloatInput(name="gtol",                  value=1e-6, width=130),
+        "alpha":       pn.widgets.FloatInput(name="alpha shift",           value=0.0, step=1e-4, width=130),
+        "beta":        pn.widgets.FloatInput(name="beta shift",            value=0.0, step=1e-4, width=130),
+        "gamma":       pn.widgets.FloatInput(name="gamma shift",           value=0.0, step=1e-4, width=130),
+        "var_thresh":  pn.widgets.FloatInput(name="variance threshold",    value=0.1, step=0.01, width=180),
+        "sigma":       pn.widgets.FloatInput(name="sigma",                 value=2.0, step=0.5,  width=120),
+        "med_thresh":  pn.widgets.FloatInput(name="threshold",             value=3.0, step=0.5,  width=120),
+        "det_thresh":  pn.widgets.FloatInput(name="detection threshold",   value=0.1, step=0.01, width=180),
+        "det_min":     pn.widgets.FloatInput(name="min object sum",        value=10.0, step=1.0, width=160),
+        "det_max":     pn.widgets.FloatInput(name="max object sum",        value=1e6, step=100., width=160),
+        "coh_thresh":  pn.widgets.FloatInput(name="threshold value",       value=0.0, step=0.1,  width=160),
+        "cmap":        pn.widgets.Select(    name="colormap", options=["viridis","jet","plasma","inferno","gray","hot"], value="viridis", width=140),
+        "log_scale":   pn.widgets.Checkbox(  name="log scale", value=False),
+        "vmin":        pn.widgets.FloatInput(name="vmin (blank=auto)", width=130),
+        "vmax":        pn.widgets.FloatInput(name="vmax (blank=auto)", width=130),
+        "4d_px":       pn.widgets.IntInput(  name="detector row (px)", value=0, width=150),
+        "4d_py":       pn.widgets.IntInput(  name="detector col (py)", value=0, width=150),
+        "save_dir":    pn.widgets.TextInput( name="output directory", placeholder="/path/to/out/", sizing_mode="stretch_width"),
+        "save_name":   pn.widgets.TextInput( name="file name (no ext)", placeholder="export", width=200),
+    }
+
+    # Only ROI-level operations — the target ROI is implicit
+    roi_op_list = [op for op, cfg in _ALL_OPS.items() if cfg["target"] == "roi"]
+    w_op       = pn.widgets.Select(name="Operation", options=roi_op_list, value=roi_op_list[0], width=300)
+    params_col = pn.Column(sizing_mode="stretch_width")
+    queue      = []
+    queue_col_r = pn.Column(sizing_mode="stretch_width")
+
+    # ── Snapshot params from local pw dict ────────────────────────────────────
+    def snapshot(op):
+        p = {}
+        if op == "Make 4D dataset":
+            p["num_jobs"] = pw["num_jobs"].value
+        elif op == "Pool detector":
+            p.update(kernel_size=pw["kernel_size"].value, stride=pw["stride"].value, padding=pw["padding"].value)
+        elif op in ("Mask region detector", "Mask region cohimgs"):
+            p.update(region=[pw["region_rs"].value, pw["region_re"].value,
+                             pw["region_cs"].value, pw["region_ce"].value],
+                     mode=pw["region_mode"].value)
+        elif op == "Make k-outs":
+            p["mask_val"] = pw["mask_val"].value
+        elif op == "Compute kins":
+            p.update(est_ttheta=pw["est_ttheta"].value, method=pw["method"].value, gtol=pw["gtol"].value)
+        elif op == "Compute kins w geometry":
+            p.update(method=pw["method"].value, gtol=pw["gtol"].value)
+        elif op == "Refine kins":
+            p.update(alpha=pw["alpha"].value, beta=pw["beta"].value, gamma=pw["gamma"].value)
+        elif op == "Filter coherent images":
+            p["var_thresh"] = pw["var_thresh"].value
+        elif op == "Remove background":
+            p["sigma"] = pw["sigma"].value
+        elif op == "Median filter (coh)":
+            p.update(kernel_size=pw["kernel_size"].value, stride=pw["stride"].value, threshold=pw["med_thresh"].value)
+        elif op == "Detect objects":
+            p.update(det_thresh=pw["det_thresh"].value, det_min=pw["det_min"].value, det_max=pw["det_max"].value)
+        elif op == "Mask cohimgs threshold":
+            p["coh_thresh"] = pw["coh_thresh"].value
+        elif op.startswith("Plot:"):
+            p.update(cmap=pw["cmap"].value, log_scale=pw["log_scale"].value,
+                     vmin=pw["vmin"].value or None, vmax=pw["vmax"].value or None)
+            if op == "Plot: 4D viewer (single)":
+                p.update(px=pw["4d_px"].value, py=pw["4d_py"].value)
+        elif op.startswith("Save:"):
+            p.update(save_dir=pw["save_dir"].value.strip(),
+                     save_name=pw["save_name"].value.strip() or "ptyxplore_export")
+        return p
+
+    # ── Refresh param panel when operation changes ────────────────────────────
+    def refresh_params(event=None):
+        op = w_op.value
+        params_col.clear()
+        if op == "Make 4D dataset":
+            params_col.append(pw["num_jobs"])
+        elif op == "Pool detector":
+            params_col.append(pn.Row(pw["kernel_size"], pw["stride"], pw["padding"]))
+        elif op in ("Mask region detector", "Mask region cohimgs"):
+            params_col.append(pn.Row(pw["region_rs"], pw["region_re"], pw["region_cs"], pw["region_ce"]))
+            params_col.append(pw["region_mode"])
+        elif op == "Make k-outs":
+            params_col.append(pw["mask_val"])
+        elif op == "Compute kins":
+            params_col.append(pn.Row(pw["est_ttheta"], pw["method"], pw["gtol"]))
+        elif op == "Compute kins w geometry":
+            params_col.append(pn.Row(pw["method"], pw["gtol"]))
+        elif op == "Refine kins":
+            params_col.append(pn.Row(pw["alpha"], pw["beta"], pw["gamma"]))
+        elif op == "Filter coherent images":
+            params_col.append(pw["var_thresh"])
+        elif op == "Remove background":
+            params_col.append(pw["sigma"])
+        elif op == "Median filter (coh)":
+            params_col.append(pn.Row(pw["kernel_size"], pw["stride"], pw["med_thresh"]))
+        elif op == "Detect objects":
+            params_col.append(pn.Row(pw["det_thresh"], pw["det_min"], pw["det_max"]))
+        elif op == "Mask cohimgs threshold":
+            params_col.append(pw["coh_thresh"])
+        elif op.startswith("Plot:"):
+            params_col.append(pn.Row(pw["cmap"], pw["log_scale"], pw["vmin"], pw["vmax"]))
+            if op == "Plot: 4D viewer (single)":
+                params_col.append(pn.Row(pw["4d_px"], pw["4d_py"]))
+        elif op.startswith("Save:"):
+            params_col.append(pw["save_dir"])
+            params_col.append(pw["save_name"])
+        elif op == "Estimate 2θ":
+            params_col.append(pn.pane.HTML(
+                "<span style='color:var(--txt-muted);font-size:12px;font-family:JetBrains Mono,monospace'>"
+                "Requires a designated Pupil ROI with k-outs computed.</span>"))
+
+    w_op.param.watch(refresh_params, "value")
+    refresh_params()
+
+    # ── Per-ROI queue buttons and callbacks ───────────────────────────────────
+    btn_add  = pn.widgets.Button(name="Add to Queue", button_type="primary", width=160)
+    btn_run  = pn.widgets.Button(name="▶  Run All",   button_type="primary", width=150)
+    btn_stop = pn.widgets.Button(name="⏹  Stop",      button_type="danger",  width=120, disabled=True)
+    btn_clear = pn.widgets.Button(name="Clear Queue", button_type="default", width=130)
+
+    def on_add(event):
+        op = w_op.value
+        if _ALL_OPS.get(op, {}).get("needs_pupil") and state["pupil_name"] is None:
+            log("This operation requires a designated Pupil ROI.", "warn")
+            pn.state.notifications.warning("No Pupil ROI set.", duration=3000)
+            return
+        queue.append({"op": op, "roi_name": roi_name,
+                      "params": snapshot(op), "status": "pending", "enabled": True})
+        _rebuild_queue(queue, queue_col_r)
+        log(f"[{roi_name}] Queued: {op}", "info")
+
+    def on_run(event):
+        if not btn_run.disabled:
+            _run_queue(queue, queue_col_r, roi_name, btn_run, btn_stop, btn_clear)
+
+    def on_stop(event):
+        _stop_event.set()
+        log(f"[{roi_name}] Stop requested — will halt after the current step finishes.", "warn")
+        btn_stop.disabled = True
+
+    def on_clear(event):
+        queue.clear()
+        _rebuild_queue(queue, queue_col_r)
+        log(f"[{roi_name}] Queue cleared.", "info")
+
+    btn_add.on_click(on_add)
+    btn_run.on_click(on_run)
+    btn_stop.on_click(on_stop)
+    btn_clear.on_click(on_clear)
+    _rebuild_queue(queue, queue_col_r)
+
+    # ── Pipeline sub-tab layout ───────────────────────────────────────────────
+    subtab_pipe = pn.Column(
+        pn.Column(
+            pn.pane.HTML("<p class='section-label'>Add Step</p>", sizing_mode="stretch_width"),
+            w_op, params_col,
+            pn.Row(btn_add),
+            sizing_mode="stretch_width", css_classes=["ptycho-card"], margin=(0, 0, 16, 0),
+        ),
+        pn.Column(
+            pn.pane.HTML("<p class='section-label'>Queue</p>", sizing_mode="stretch_width"),
+            queue_col_r,
+            pn.pane.HTML("<hr class='divider'>", sizing_mode="stretch_width"),
+            pn.Row(btn_run, btn_stop, btn_clear),
+            sizing_mode="stretch_width", css_classes=["ptycho-card"],
+        ),
+        sizing_mode="stretch_width", margin=(16, 0),
+    )
+
+    # ── 4D Dataset Viewer — Bokeh (no ROI selector — this tab owns one ROI) ──
+    from bokeh.models import (
+        ColumnDataSource, LinearColorMapper, ColorBar,
+        HoverTool, BasicTicker,
+    )
+    from bokeh.plotting import figure as bk_figure
+
+    w_prow     = pn.widgets.IntSlider(name="det row",  start=0, end=1, value=0, width=280)
+    w_pcol     = pn.widgets.IntSlider(name="det col",  start=0, end=1, value=0, width=280)
+    w_lrow     = pn.widgets.IntSlider(name="scan row", start=0, end=1, value=0, width=280)
+    w_lcol     = pn.widgets.IntSlider(name="scan col", start=0, end=1, value=0, width=280)
+    w_cmap_coh = pn.widgets.Select(
+        name="coh cmap", options=["plasma","viridis","jet","gray","hot","turbo"], value="plasma", width=120)
+    w_cmap_det = pn.widgets.Select(
+        name="det cmap", options=["viridis","plasma","jet","gray","hot","turbo"], value="viridis", width=120)
+    fi_coh_vmin = pn.widgets.FloatInput(name="coh vmin", width=100)
+    fi_coh_vmax = pn.widgets.FloatInput(name="coh vmax", width=100)
+    fi_det_vmin = pn.widgets.FloatInput(name="det vmin", width=100)
+    fi_det_vmax = pn.widgets.FloatInput(name="det vmax", width=100)
+    btn_coh_auto = pn.widgets.Button(name="Auto", button_type="default", width=60)
+    btn_det_auto = pn.widgets.Button(name="Auto", button_type="default", width=60)
+    fdmsg        = pn.pane.HTML("", sizing_mode="stretch_width")
+
+    _blank4 = np.zeros((64, 64), dtype=np.float32)
+
+    # Coherent Bokeh figure
+    _coh_src = ColumnDataSource({'image': [_blank4.copy()], 'x': [0], 'y': [0], 'dw': [64], 'dh': [64]})
+    _coh_map = LinearColorMapper(palette=_bk_palette("plasma"), low=0, high=1, nan_color='black')
+    _coh_mark = ColumnDataSource({'x': [32.0], 'y': [32.0], 'w': [2.0], 'h': [2.0]})
+    _coh_fig = bk_figure(
+        title="Coherent", sizing_mode="stretch_width", height=380,
+        tools="pan,wheel_zoom,reset,tap", active_scroll="wheel_zoom",
+        match_aspect=True,
+        background_fill_color=BG_DARK, border_fill_color=BG_MID,
+    )
+    _coh_fig.y_range.flipped = True
+    _coh_fig.image('image', 'x', 'y', 'dw', 'dh', source=_coh_src, color_mapper=_coh_map)
+    _coh_fig.rect('x', 'y', 'w', 'h', source=_coh_mark,
+                  fill_color=None, line_color='white', line_width=1.5)
+    _coh_fig.add_tools(HoverTool(tooltips=[("col", "$x{0}"), ("row", "$y{0}")]))
+    _coh_fig.add_layout(ColorBar(color_mapper=_coh_map, ticker=BasicTicker(), location=(0, 0)), 'right')
+
+    # Detector Bokeh figure
+    _det_src = ColumnDataSource({'image': [_blank4.copy()], 'x': [0], 'y': [0], 'dw': [64], 'dh': [64]})
+    _det_map = LinearColorMapper(palette=_bk_palette("viridis"), low=0, high=1, nan_color='black')
+    _det_mark = ColumnDataSource({'x': [32.0], 'y': [32.0], 'w': [4.0], 'h': [4.0]})
+    _det_fig = bk_figure(
+        title="Detector", sizing_mode="stretch_width", height=380,
+        tools="pan,wheel_zoom,reset,tap", active_scroll="wheel_zoom",
+        match_aspect=True,
+        background_fill_color=BG_DARK, border_fill_color=BG_MID,
+    )
+    _det_fig.y_range.flipped = True
+    _det_fig.image('image', 'x', 'y', 'dw', 'dh', source=_det_src, color_mapper=_det_map)
+    _det_fig.rect('x', 'y', 'w', 'h', source=_det_mark,
+                  fill_color=None, line_color='white', line_width=1.5)
+    _det_fig.add_tools(HoverTool(tooltips=[("col", "$x{0}"), ("row", "$y{0}")]))
+    _det_fig.add_layout(ColorBar(color_mapper=_det_map, ticker=BasicTicker(), location=(0, 0)), 'right')
+
+    def _apply_coh_scale(event=None):
+        d = _coh_src.data['image'][0]
+        _coh_map.low  = fi_coh_vmin.value if fi_coh_vmin.value is not None else float(np.nanmin(d))
+        _coh_map.high = fi_coh_vmax.value if fi_coh_vmax.value is not None else float(np.nanmax(d))
+
+    def _apply_det_scale(event=None):
+        d = _det_src.data['image'][0]
+        _det_map.low  = fi_det_vmin.value if fi_det_vmin.value is not None else float(np.nanmin(d))
+        _det_map.high = fi_det_vmax.value if fi_det_vmax.value is not None else float(np.nanmax(d))
+
+    def _coh_autoscale(event=None):
+        fi_coh_vmin.value = fi_coh_vmax.value = None
+        d = _coh_src.data['image'][0]
+        _coh_map.low = float(np.nanmin(d));  _coh_map.high = float(np.nanmax(d))
+
+    def _det_autoscale(event=None):
+        fi_det_vmin.value = fi_det_vmax.value = None
+        d = _det_src.data['image'][0]
+        _det_map.low = float(np.nanmin(d));  _det_map.high = float(np.nanmax(d))
+
+    fi_coh_vmin.param.watch(_apply_coh_scale, 'value')
+    fi_coh_vmax.param.watch(_apply_coh_scale, 'value')
+    fi_det_vmin.param.watch(_apply_det_scale, 'value')
+    fi_det_vmax.param.watch(_apply_det_scale, 'value')
+    btn_coh_auto.on_click(_coh_autoscale)
+    btn_det_auto.on_click(_det_autoscale)
+
+    def update_viewer(*_):
+        roi = state["rois"].get(roi_name)
+        if roi is None or roi.data_4d is None:
+            fdmsg.object = ("<span style='color:var(--txt-muted)'>"
+                            "Run <b>Make 4D dataset</b> on this ROI first.</span>")
+            return
+        fdmsg.object = ""
+        from ptyxplore.data_proc import make_coherent_image, make_detector_image
+        prow, pcol = w_prow.value, w_pcol.value
+        lrow, lcol = w_lrow.value, w_lcol.value
+        coh = make_coherent_image(roi.data_4d, np.array([prow, pcol])).astype(float)
+        det = make_detector_image(roi.data_4d, np.array([lrow, lcol])).astype(float)
+        hc, wc = coh.shape;  hd, wd = det.shape
+
+        # Update coh source + colormap
+        _coh_map.palette = _bk_palette(w_cmap_coh.value)
+        lo_c = fi_coh_vmin.value if fi_coh_vmin.value is not None else float(np.nanmin(coh))
+        hi_c = fi_coh_vmax.value if fi_coh_vmax.value is not None else float(np.nanmax(coh))
+        if abs(hi_c - lo_c) < 1e-10: hi_c = lo_c + 1.0
+        _coh_map.low = lo_c;  _coh_map.high = hi_c
+        _coh_src.data = {'image': [coh], 'x': [0], 'y': [0], 'dw': [wc], 'dh': [hc]}
+        _coh_mark.data = {'x': [lcol + 0.5], 'y': [lrow + 0.5], 'w': [2.0], 'h': [2.0]}
+        _coh_fig.title.text = f"Coherent  det=({pcol}, {prow})"
+
+        # Update det source + colormap
+        _det_map.palette = _bk_palette(w_cmap_det.value)
+        lo_d = fi_det_vmin.value if fi_det_vmin.value is not None else float(np.nanmin(det))
+        hi_d = fi_det_vmax.value if fi_det_vmax.value is not None else float(np.nanmax(det))
+        if abs(hi_d - lo_d) < 1e-10: hi_d = lo_d + 1.0
+        _det_map.low = lo_d;  _det_map.high = hi_d
+        _det_src.data = {'image': [det], 'x': [0], 'y': [0], 'dw': [wd], 'dh': [hd]}
+        _det_mark.data = {'x': [pcol + 0.5], 'y': [prow + 0.5], 'w': [4.0], 'h': [4.0]}
+        _det_fig.title.text = f"Detector  scan=({lcol}, {lrow})"
+
+    def init_viewer():
+        roi = state["rois"].get(roi_name)
+        if roi and roi.data_4d is not None:
+            dsh, csh = roi.data_4d.shape[2:], roi.data_4d.shape[:2]
+            def _init():
+                w_prow.end = dsh[0] - 1;  w_prow.value = dsh[0] // 2
+                w_pcol.end = dsh[1] - 1;  w_pcol.value = dsh[1] // 2
+                w_lrow.end = csh[0] - 1;  w_lrow.value = csh[0] // 2
+                w_lcol.end = csh[1] - 1;  w_lcol.value = csh[1] // 2
+                update_viewer()
+            pn.state.execute(_init)
+        else:
+            pn.state.execute(update_viewer)
+
+    roi_4dv_hooks[roi_name] = init_viewer  # called by _execute_step after Make 4D dataset
+
+    for _w in (w_prow, w_pcol, w_lrow, w_lcol, w_cmap_coh, w_cmap_det):
+        _w.param.watch(update_viewer, "value")
+    init_viewer()
+
+    # ── Per-ROI gallery ───────────────────────────────────────────────────────
+    per_gallery     = []
+    per_gallery_col = pn.Column(sizing_mode="stretch_width")
+    btn_gal_clear   = pn.widgets.Button(name="Clear", button_type="default", width=100)
+
+    def rebuild_gallery():
+        per_gallery_col.clear()
+        if not per_gallery:
+            per_gallery_col.append(pn.pane.HTML(
+                "<span style='color:var(--txt-muted);font-family:JetBrains Mono,monospace;font-size:12px'>"
+                "No plots yet — run pipeline Plot steps.</span>"))
+            return
+        for i, gitem in enumerate(reversed(per_gallery)):
+            actual_idx = len(per_gallery) - 1 - i
+            def _make_grm(idx=actual_idx):
+                btn = pn.widgets.Button(name="✕", button_type="default", width=40)
+                def _rm(event):
+                    if idx < len(per_gallery):
+                        removed = per_gallery.pop(idx)
+                        try: plt.close(removed["fig"])
+                        except Exception: pass
+                        rebuild_gallery()
+                btn.on_click(_rm)
+                return btn
+            per_gallery_col.append(pn.Column(
+                pn.Row(
+                    pn.pane.HTML(
+                        f"<span style='font-family:JetBrains Mono,monospace;font-size:12px;"
+                        f"color:var(--accent)'>{len(per_gallery)-i}. {gitem['title']}</span>"),
+                    _make_grm(), align="center"),
+                gitem["pane"],
+                pn.pane.HTML("<hr class='divider'>", sizing_mode="stretch_width"),
+                sizing_mode="stretch_width",
+            ))
+
+    def add_to_per_gallery(title, fig_or_panel):
+        """Add a matplotlib figure or a Panel component to the per-ROI gallery."""
+        if isinstance(fig_or_panel, pn.viewable.Viewable):
+            pane = fig_or_panel
+        else:
+            pane = pn.pane.Matplotlib(
+                fig_or_panel, tight=True, sizing_mode="stretch_width", height=460)
+            plt.close(fig_or_panel)
+        per_gallery.append({"title": title, "pane": pane, "fig": None})
+        rebuild_gallery()
+
+    def on_gal_clear(event):
+        for gitem in per_gallery:
+            try: plt.close(gitem["fig"])
+            except Exception: pass
+        per_gallery.clear()
+        rebuild_gallery()
+
+    roi_gallery_hooks[roi_name] = add_to_per_gallery  # called by _add_to_gallery
+    btn_gal_clear.on_click(on_gal_clear)
+    rebuild_gallery()
+
+    # ── Visualisation sub-tab layout ──────────────────────────────────────────
+    subtab_vis = pn.Column(
+        pn.Column(
+            pn.pane.HTML("<p class='section-label'>4D Dataset Viewer</p>", sizing_mode="stretch_width"),
+            pn.pane.HTML(
+                "<span style='font-family:JetBrains Mono,monospace;font-size:11px;"
+                "color:var(--txt-muted)'>Scroll to zoom · White box = cross-cursor position</span>"),
+            pn.Row(
+                pn.Column(
+                    pn.pane.HTML("<span style='font-size:11px;color:var(--accent2);font-family:JetBrains Mono,monospace'>Detector pixel (coherent view)</span>"),
+                    pn.Row(w_prow, w_pcol),
+                    pn.Row(w_cmap_coh, fi_coh_vmin, fi_coh_vmax, btn_coh_auto, align="end"),
+                    sizing_mode="stretch_width",
+                ),
+                pn.Column(
+                    pn.pane.HTML("<span style='font-size:11px;color:var(--accent2);font-family:JetBrains Mono,monospace'>Scan position (detector view)</span>"),
+                    pn.Row(w_lrow, w_lcol),
+                    pn.Row(w_cmap_det, fi_det_vmin, fi_det_vmax, btn_det_auto, align="end"),
+                    sizing_mode="stretch_width",
+                ),
+            ),
+            fdmsg,
+            pn.Row(_coh_fig, _det_fig, sizing_mode="stretch_width"),
+            sizing_mode="stretch_width", css_classes=["ptycho-card"], margin=(0, 0, 16, 0),
+        ),
+        pn.Column(
+            pn.pane.HTML("<p class='section-label'>Pipeline Outputs</p>", sizing_mode="stretch_width"),
+            pn.Row(btn_gal_clear),
+            per_gallery_col,
+            sizing_mode="stretch_width", css_classes=["ptycho-card"],
+        ),
+        sizing_mode="stretch_width", margin=(16, 0),
+    )
+
+    return pn.Tabs(
+        ("Pipeline",      subtab_pipe),
+        ("Visualisation", subtab_vis),
+        sizing_mode="stretch_width",
+        dynamic=True,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  Tabs + main dashboard
 # ═══════════════════════════════════════════════════════════════════════════════
 
 tabs = pn.Tabs(
-    ("Loading",      tab_loading),
-    ("ROI Manager",  tab_roi_manager),
-    ("Pipeline",     tab_pipeline),
-    ("Visualisation",tab_vis),
-    ("Python",       tab_python),
+    ("Scan Loading",     tab_loading),
+    ("ROI Manager", tab_roi_manager),
+    ("Python",      tab_python),
     sizing_mode="stretch_width",
     dynamic=True,
 )
