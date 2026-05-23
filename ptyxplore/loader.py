@@ -4,7 +4,7 @@
 # Email: ahmed.mokhtar@desy.de
 # Date : Nov 2025
 
-import numpy as np 
+import numpy as np
 import h5py
 import copy
 import json
@@ -13,9 +13,38 @@ from functools import wraps
 import re
 
 import glob
-import os 
+import os
 from .utils import time_it, parse_log, log_roi_params, inject_attrs
 from . import utils as ut
+
+
+def _save_streakable(group, name, data):
+    """Save data that may be a list (multi-streak) or a single ndarray.
+
+    Multi-streak: creates a sub-group with datasets streak_0, streak_1, …
+    Single array: creates a dataset directly.
+    Chunking is always enabled because gzip compression requires it.
+    """
+    if isinstance(data, list):
+        sub = group.create_group(name)
+        sub.attrs['n_streaks'] = len(data)
+        for i, arr in enumerate(data):
+            sub.create_dataset(f'streak_{i}', data=np.array(arr),
+                               compression='gzip', chunks=True)
+    elif data is not None:
+        group.create_dataset(name, data=data, compression='gzip', chunks=True)
+
+
+def _load_streakable(group, name):
+    """Load a dataset that was saved by _save_streakable.
+
+    Returns a list of arrays for multi-streak data, or a single array otherwise.
+    """
+    item = group[name]
+    if isinstance(item, h5py.Group):
+        n = int(item.attrs['n_streaks'])
+        return [item[f'streak_{i}'][...] for i in range(n)]
+    return item[...]
 
 @dataclass
 class Exp:
@@ -130,19 +159,25 @@ class ROI:
     
     coords: np.ndarray = field(default=None, repr=False)
 
+    # Optional pixel mask, shape == (re-rs, ce-cs) matching coords bounding box.
+    # Non-zero pixels are kept; zero pixels are zeroed out in the 4D dataset.
+    detector_mask: np.ndarray = field(default=None, repr=False)
+
     # acquired later
     data_4d: np.ndarray = field(default=None, repr=False) # 4D Data set (x, y, fx, fy)
     centre_pixel: np.ndarray = field(default=(0,0), repr=False)
     
     # to be set automatically
-    __averaged_det_images: np.ndarray = field(default=None, repr=False)  # Average of all detector frames 
-    __averaged_coherent_images: np.ndarray = field(default=None, repr=False)
+    _averaged_det_images: np.ndarray = field(default=None, repr=False)  # Average of all detector frames 
+    _averaged_coherent_images: np.ndarray = field(default=None, repr=False)
+    _summed_coherent_images: np.ndarray = field(default=None, repr=False)
+    tilt_corrected_image : np.ndarray = field(default=None, repr = False)
     
     # Data
     # needs to be set manually
     detected_objects: np.ndarray = field(default=None, repr=False) # Detected Objects
     coherent_imgs: np.ndarray = field(default=None, repr=False)
-    
+        
     # k-space params
     kout_coords: np.ndarray = field(default=None, repr=False)  # Coords
     kouts: np.ndarray = field(default=None, repr=False)  # Kout vectors
@@ -176,34 +211,126 @@ class ROI:
     @property
     def averaged_det_images(self):
         
-        if self.__averaged_det_images is None:
-            self.__averaged_det_images = np.mean(self.data_4d, axis=(0,1))
+        if self._averaged_det_images is None:
+            self._averaged_det_images = np.mean(self.data_4d, axis=(0,1))
             
-        return self.__averaged_det_images
+        return self._averaged_det_images
 
     def update_averaged_det_images(self):
-        self.__averaged_det_images = np.mean(self.data_4d, axis=(0,1))
+        self._averaged_det_images = np.mean(self.data_4d, axis=(0,1))
 
     @averaged_det_images.setter
     def averaged_det_images(self, value):
-        self.__averaged_det_images = value
+        self._averaged_det_images = value
     
     @property
     def averaged_coherent_images(self):
         
-        if self.__averaged_coherent_images is None:
-            self.__averaged_coherent_images = np.mean(self.data_4d, axis=(2,3))
+        if self._averaged_coherent_images is None:
+            self._averaged_coherent_images = np.mean(self.data_4d, axis=(2,3))
         
-        return self.__averaged_coherent_images
+        return self._averaged_coherent_images
     
     @averaged_coherent_images.setter
     def averaged_coherent_images(self, value):
-        self.__averaged_coherent_images = value
+        self._averaged_coherent_images = value
         
     def update_averaged_coherent_images(self):
-        self.__averaged_coherent_images = np.mean(self.data_4d, axis=(2,3))
+        self._averaged_coherent_images = np.sum(self.data_4d, axis=(2,3))
     
+    @property
+    def summed_coherent_images(self):
+        
+        if self._summed_coherent_images is None:
+            self._summed_coherent_images = np.sum(self.data_4d, axis=(2,3))
+        
+        return self._summed_coherent_images
     
+    @summed_coherent_images.setter
+    def summed_coherent_images(self, value):
+        self._summed_coherent_images = value
+        
+    def update_summed_coherent_images(self):
+        self._summed_coherent_images = np.sum(self.data_4d, axis=(2,3))
+
+    # _______________ Arithmetic _______________
+
+    def __add__(self, other):
+        if not isinstance(other, ROI):
+            print('here')
+            return NotImplemented
+
+        if self.data_4d is None or other.data_4d is None:
+            raise ValueError("Both ROIs must have data_4d loaded before adding.")
+
+        if self.data_4d.shape != other.data_4d.shape:
+            raise ValueError(
+                f"data_4d shape mismatch: {self.data_4d.shape} vs {other.data_4d.shape}"
+            )
+
+        if not np.isclose(self.step_size_x, other.step_size_x):
+            raise ValueError(
+                f"step_size_x mismatch: {self.step_size_x} vs {other.step_size_x}"
+            )
+
+        if not np.isclose(self.step_size_y, other.step_size_y):
+            raise ValueError(
+                f"step_size_y mismatch: {self.step_size_y} vs {other.step_size_y}"
+            )
+
+        new = copy.deepcopy(self)
+        new.data_4d = self.data_4d + other.data_4d
+        new.exposure_time = self.exposure_time + other.exposure_time
+
+        # invalidate cached aggregates — they must be recomputed from new data_4d
+        new._ROI__averaged_det_images = None
+        new._ROI__averaged_coherent_images = None
+        new._ROI__summed_coherent_images = None
+
+        new.checkpoint_stack = []
+        new.log_params = []
+
+        return new
+
+    def __itruediv__(self, other):
+        """Normalise self in-place by other's per-position detector intensity.
+
+        Equivalent to normalise_detector(self, other): divides each scan
+        position's detector frame by the total counts in the corresponding
+        frame of *other*, then rescales by the mean so the overall intensity
+        level is preserved.
+        """
+        if not isinstance(other, ROI):
+            return NotImplemented
+
+        if self.data_4d is None or other.data_4d is None:
+            raise ValueError("Both ROIs must have data_4d loaded before dividing.")
+
+        if self.data_4d.shape[:2] != other.data_4d.shape[:2]:
+            raise ValueError(
+                f"data_4d shape mismatch: {self.data_4d.shape[:2]} vs {other.data_4d.shape[:2]}"
+            )
+
+        if not np.isclose(self.step_size_x, other.step_size_x):
+            raise ValueError(
+                f"step_size_x mismatch: {self.step_size_x} vs {other.step_size_x}"
+            )
+
+        if not np.isclose(self.step_size_y, other.step_size_y):
+            raise ValueError(
+                f"step_size_y mismatch: {self.step_size_y} vs {other.step_size_y}"
+            )
+
+        peak_intensity = np.sum(other.data_4d, axis=(-2, -1))
+        avg_intensity = np.mean(peak_intensity)
+        self.data_4d = self.data_4d / peak_intensity[..., np.newaxis, np.newaxis] * avg_intensity
+
+        self._ROI__averaged_det_images = None
+        self._ROI__averaged_coherent_images = None
+        self._ROI__summed_coherent_images = None
+
+        return self
+
     # _______________ Saving ___________________
     
             
@@ -237,12 +364,13 @@ class ROI:
             process_params.attrs['det_distance'] = self.det_distance
             
             images = h5f.create_group("processed_images")
-            images.create_dataset("coherent_images", data=self.coherent_imgs, compression="gzip",chunks=True)    
+            _save_streakable(images, "coherent_images", self.coherent_imgs)
+
             kvectors = h5f.create_group("kvectors")
-            kvectors.create_dataset("kins", data=self.kins, compression="gzip")
-            kvectors.create_dataset("kouts", data = self.kouts, compression='gzip')
-            kvectors.create_dataset("kin_coords", data=self.kin_coords, compression="gzip")
-            kvectors.create_dataset("kout_coords", data = self.kout_coords, compression='gzip')
+            _save_streakable(kvectors, "kins",        self.kins)
+            _save_streakable(kvectors, "kouts",       self.kouts)
+            _save_streakable(kvectors, "kin_coords",  self.kin_coords)
+            _save_streakable(kvectors, "kout_coords", self.kout_coords)
                 
             print(f"Data saved at {file_path}")
 
@@ -300,16 +428,13 @@ class ROI:
             self.det_distance = params.attrs['det_distance'] 
 
             images = h5f["processed_images"]
-            
-            self.coherent_imgs = images["coherent_images"][...]
-            
-            # Load K-Vectors 
+            self.coherent_imgs = _load_streakable(images, "coherent_images")
+
             kvectors = h5f["kvectors"]
-            
-            self.kins = kvectors['kins'][...]
-            self.kouts = kvectors['kouts'][...]
-            self.kin_coords = kvectors['kin_coords'][...]
-            self.kout_coords = kvectors['kout_coords'][...]
+            self.kins       = _load_streakable(kvectors, "kins")
+            self.kouts      = _load_streakable(kvectors, "kouts")
+            self.kin_coords = _load_streakable(kvectors, "kin_coords")
+            self.kout_coords = _load_streakable(kvectors, "kout_coords")
                 
         return self
     

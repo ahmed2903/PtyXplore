@@ -4,6 +4,7 @@
 # Email: ahmed.mokhtar@desy.de
 
 import os
+from typing import Any
 
 import h5py
 import matplotlib.pyplot as plt
@@ -12,7 +13,7 @@ from IPython.display import display
 from matplotlib.patches import Rectangle
 import ipywidgets as widgets
 
-from .cbd_loader import ROI
+from .loader import ROI
 from .data_io import stack_4d_data_old
 from .data_proc import (
     compute_histograms,
@@ -21,7 +22,7 @@ from .data_proc import (
     mask_hot_pixels,
 )
 from .plotting import plot_map_on_detector, plot_roi_from_numpy
-
+from .roi_ops import tilt_correct
 
 def plot_detector_roi(roi: ROI, file_no, frame_no,
                       title=None, vmin=None, vmax=None,
@@ -84,17 +85,51 @@ def plot_full_detector(roi: ROI, file_no, frame_no,
     plt.show()
 
 
+def _scan_extent(roi):
+    """Return (extent, xlabel, ylabel) for imshow of a coherent image.
+
+    `extent` is [left, right, bottom, top] in nm, suitable for matplotlib's
+    ``imshow(extent=...)``.  Returns ``None`` for extent when the scan-position
+    attributes are not present on *roi*.
+
+    The mapping depends on ``roi.slow_axis``:
+      - ``'scan_x'``: rows → X motor (slow), cols → Y motor (fast)
+      - anything else: rows → Y motor (slow), cols → X motor (fast)
+    """
+    _x = ("scan_x_start_point", "scan_x_end_point")
+    _y = ("scan_y_start_point", "scan_y_end_point")
+    if not (all(hasattr(roi, a) for a in _x) and all(hasattr(roi, a) for a in _y)):
+        return None, "Scan X", "Scan Y"
+
+    x0, x1 = roi.scan_x_start_point, roi.scan_x_end_point
+    y0, y1 = roi.scan_y_start_point, roi.scan_y_end_point
+
+    if getattr(roi, "slow_axis", None) == "scan_x":
+        # rows = X (slow axis), cols = Y (fast axis)
+        extent = [y0, y1, x1, x0]      # [left, right, bottom, top]
+        xlabel, ylabel = "Scan Y (nm)", "Scan X (nm)"
+    else:
+        # rows = Y (slow axis), cols = X (fast axis)
+        extent = [x0, x1, y1, y0]
+        xlabel, ylabel = "Scan X (nm)", "Scan Y (nm)"
+
+    return extent, xlabel, ylabel
+
+
 def plot_4d_dataset(roi: ROI,
                     vmin1=None, vmax1=None,
                     vmin2=None, vmax2=None,
-                    pixel_threshold=None):
+                    pixel_threshold=None,
+                    use_positions=False):
     """Interactive viewer for a 4D dataset: coherent image ↔ detector image.
 
     Linked sliders let you pick a detector pixel to form the coherent image
     and a scan position to form the detector image.
 
     Args:
-        roi: ROI with `data_4d` loaded (shape M×N×px×py).
+        roi:           ROI with `data_4d` loaded (shape M×N×px×py).
+        use_positions: If True, label the coherent-image axes with motor
+                       positions in nm instead of pixel indices.
     """
     coherent_shape = roi.data_4d.shape[:2]
     detector_shape = roi.data_4d.shape[2:]
@@ -107,20 +142,74 @@ def plot_4d_dataset(roi: ROI,
     rect_size_det = 4
     rect_size_coh = 2
 
+    # Position extent for coherent image
+    extent, coh_xlabel, coh_ylabel = _scan_extent(roi) if use_positions else (None, "Scan X", "Scan Y")
+
+    # Helpers to convert pixel index → nm for the rectangle overlay
+    def _coh_col_to_nm(col):
+        if extent is None:
+            return col
+        left, right = extent[0], extent[1]
+        return left + col * (right - left) / max(coherent_shape[1] - 1, 1)
+
+    def _coh_row_to_nm(row):
+        if extent is None:
+            return row
+        top, bottom = extent[3], extent[2]
+        return top + row * (bottom - top) / max(coherent_shape[0] - 1, 1)
+
+    def _coh_size_col(n):
+        if extent is None:
+            return n
+        return n * (extent[1] - extent[0]) / max(coherent_shape[1] - 1, 1)
+
+    def _coh_size_row(n):
+        if extent is None:
+            return n
+        return n * (extent[2] - extent[3]) / max(coherent_shape[0] - 1, 1)
+
+    # Global data ranges for slider bounds
+    coh_data_min, coh_data_max = 0, roi.data_4d.max()
+    det_data_min, det_data_max = 0, roi.data_4d.max()
+    coh_step = max((coh_data_max - coh_data_min) / 500, 1e-6)
+    det_step = max((det_data_max - det_data_min) / 500, 1e-6)
+
+    clim1_slider = widgets.FloatRangeSlider(
+        value=[vmin1 if vmin1 is not None else coh_data_min,
+               vmax1 if vmax1 is not None else coh_data_max],
+        min=coh_data_min, max=coh_data_max, step=coh_step,
+        description='Coh range', continuous_update=True,
+        layout=widgets.Layout(width='60%'),
+    )
+    clim2_slider = widgets.FloatRangeSlider(
+        value=[vmin2 if vmin2 is not None else det_data_min,
+               vmax2 if vmax2 is not None else det_data_max],
+        min=det_data_min, max=det_data_max, step=det_step,
+        description='Det range', continuous_update=True,
+        layout=widgets.Layout(width='60%'),
+    )
+
     fig, axes = plt.subplots(1, 2, figsize=(10, 5))
     coh_img = make_coherent_image(roi.data_4d, np.array([prow_slider.value, pcol_slider.value]))
     det_img = make_detector_image(roi.data_4d, np.array([lrow_slider.value, lcol_slider.value]))
 
-    im0 = axes[0].imshow(coh_img, cmap='plasma', vmin=vmin1, vmax=vmax1)
+    if extent is not None:
+        im0 = axes[0].imshow(coh_img, cmap='plasma', vmin=clim1_slider.value[0], vmax=clim1_slider.value[1], extent=extent)
+    else:
+        im0 = axes[0].imshow(coh_img, cmap='plasma', vmin=clim1_slider.value[0], vmax=clim1_slider.value[1])
     axes[0].set_title(f"Coherent Image (lx={lrow_slider.value}, ly={lcol_slider.value})")
+    axes[0].set_xlabel(coh_xlabel)
+    axes[0].set_ylabel(coh_ylabel)
     rect_coh = Rectangle(
-        (lcol_slider.value - rect_size_coh / 2, lrow_slider.value - rect_size_coh / 2),
-        rect_size_coh, rect_size_coh, edgecolor='white', facecolor='none', lw=2,
+        (_coh_col_to_nm(lcol_slider.value) - _coh_size_col(rect_size_coh) / 2,
+         _coh_row_to_nm(lrow_slider.value) - _coh_size_row(rect_size_coh) / 2),
+        _coh_size_col(rect_size_coh), _coh_size_row(rect_size_coh),
+        edgecolor='white', facecolor='none', lw=2,
     )
     axes[0].add_patch(rect_coh)
     plt.colorbar(im0, ax=axes[0], label="Intensity")
 
-    im1 = axes[1].imshow(det_img, cmap='viridis', vmin=vmin2, vmax=vmax2)
+    im1 = axes[1].imshow(det_img, cmap='viridis', vmin=clim2_slider.value[0], vmax=clim2_slider.value[1])
     axes[1].set_title(f"Detector Image (px={pcol_slider.value}, py={prow_slider.value})")
     rect_det = Rectangle(
         (pcol_slider.value - rect_size_det / 2, prow_slider.value - rect_size_det / 2),
@@ -130,72 +219,188 @@ def plot_4d_dataset(roi: ROI,
     plt.colorbar(im1, ax=axes[1], label="Detector Intensity")
     plt.tight_layout()
 
-    def update_plot(prow, pcol, lrow, lcol):
+    def update_plot(prow, pcol, lrow, lcol, clim1, clim2):
         coh = make_coherent_image(roi.data_4d, np.array([prow, pcol]))
         det = make_detector_image(roi.data_4d, np.array([lrow, lcol]))
-        m = np.mean(coh)
         im0.set_data(coh)
-        im0.set_clim(m - 0.05 * m, m + 0.05 * m)
+        im0.set_clim(*clim1)
         axes[0].set_title(f"Coherent Image from pixel ({pcol}, {prow})")
-        rect_coh.set_xy((lcol - rect_size_coh / 2, lrow - rect_size_coh / 2))
-        m = np.mean(det)
+        rect_coh.set_xy((_coh_col_to_nm(lcol) - _coh_size_col(rect_size_coh) / 2,
+                         _coh_row_to_nm(lrow) - _coh_size_row(rect_size_coh) / 2))
         im1.set_data(det)
-        im1.set_clim(m - 0.3 * m, m + 0.2 * m)
+        im1.set_clim(*clim2)
         axes[1].set_title(f"Detector Image at location ({lcol}, {lrow})")
         rect_det.set_xy((pcol - rect_size_det / 2, prow - rect_size_det / 2))
         fig.canvas.draw_idle()
 
     display(widgets.interactive(update_plot,
                                 prow=prow_slider, pcol=pcol_slider,
-                                lrow=lrow_slider, lcol=lcol_slider))
+                                lrow=lrow_slider, lcol=lcol_slider,
+                                clim1=clim1_slider, clim2=clim2_slider))
 
 
-def plot_coherent_sequence(roi: ROI, scale_factor=0.4, vmin=None, vmax=None):
-    """Interactive slider viewer for `roi.coherent_imgs`."""
-    img_list   = roi.coherent_imgs
-    num_images = len(img_list)
+def plot_coherent_sequence(roi: ROI, scale_factor=0.4, vmin=None, vmax=None,
+                           use_positions=False):
+    """Interactive slider viewer for `roi.coherent_imgs`.
 
-    img_slider = widgets.IntSlider(min=0, max=num_images - 1, value=0, description="Image")
-    vmin_box   = widgets.FloatText(value=0.1, description='Vmin:')
-    vmax_box   = widgets.FloatText(value=1.0,  description='Vmax:')
+    Handles both single-streak ROIs (coherent_imgs is an (N, H, W) array) and
+    multi-streak ROIs (coherent_imgs is a list of (N_s, H, W) arrays).
+    Multi-streak mode adds a Streak slider that updates the Image slider range.
 
-    fig, ax = plt.subplots(figsize=(6, 6))
-    im = ax.imshow(img_list[0], cmap='viridis')
-    ax.set_title(f"Coherent Image  0/{num_images - 1}")
-    ax.set_xlabel('Scan-X')
-    ax.set_ylabel('Scan-Y')
-    plt.colorbar(im, ax=ax, label="Intensity")
-    plt.tight_layout()
+    Args:
+        use_positions: If True, label axes with motor positions in nm.
+    """
+    multi = isinstance(roi.coherent_imgs, list)
+    extent, xlabel, ylabel = _scan_extent(roi) if use_positions else (None, "Scan X", "Scan Y")
 
-    def update_image(img_idx, vmin, vmax):
-        im.set_data(img_list[img_idx])
-        im.set_clim(vmin, vmax)
-        ax.set_title(f"Coherent Image  {img_idx}/{num_images - 1}")
-        fig.canvas.draw_idle()
+    if multi:
+        all_imgs  = roi.coherent_imgs
+        n_streaks = len(all_imgs)
 
-    display(widgets.interactive(update_image, img_idx=img_slider, vmin=vmin_box, vmax=vmax_box))
+        streak_slider = widgets.IntSlider(min=0, max=n_streaks - 1, value=0, description="Streak")
+        img_slider    = widgets.IntSlider(min=0, max=len(all_imgs[0]) - 1, value=0, description="Image")
+        vmin_box      = widgets.FloatText(value=vmin if vmin is not None else 0.1, description='Vmin:')
+        vmax_box      = widgets.FloatText(value=vmax if vmax is not None else 1.0,  description='Vmax:')
+
+        fig, ax = plt.subplots(figsize=(6, 6))
+        first = np.array(all_imgs[0][0])
+        im = ax.imshow(first, cmap='viridis', **({"extent": extent} if extent else {}))
+        ax.set_title(f"Streak 0 — Image 0/{len(all_imgs[0]) - 1}")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        plt.colorbar(im, ax=ax, label="Intensity")
+        plt.tight_layout()
+
+        def _update_img_range(change):
+            s = streak_slider.value
+            img_slider.max   = len(all_imgs[s]) - 1
+            img_slider.value = min(img_slider.value, img_slider.max)
+
+        streak_slider.observe(_update_img_range, names='value')
+
+        def update_image(streak_idx, img_idx, vmin, vmax):
+            imgs    = all_imgs[streak_idx]
+            img_idx = min(img_idx, len(imgs) - 1)
+            im.set_data(np.array(imgs[img_idx]))
+            im.set_clim(vmin, vmax)
+            ax.set_title(f"Streak {streak_idx} — Image {img_idx}/{len(imgs) - 1}")
+            fig.canvas.draw_idle()
+
+        display(widgets.interactive(update_image,
+                                    streak_idx=streak_slider, img_idx=img_slider,
+                                    vmin=vmin_box, vmax=vmax_box))
+    else:
+        img_list   = roi.coherent_imgs
+        num_images = len(img_list)
+
+        img_slider = widgets.IntSlider(min=0, max=num_images - 1, value=0, description="Image")
+        vmin_box   = widgets.FloatText(value=vmin if vmin is not None else 0.1, description='Vmin:')
+        vmax_box   = widgets.FloatText(value=vmax if vmax is not None else 1.0,  description='Vmax:')
+
+        fig, ax = plt.subplots(figsize=(6, 6))
+        im = ax.imshow(img_list[0], cmap='viridis', **({"extent": extent} if extent else {}))
+        ax.set_title(f"Coherent Image  0/{num_images - 1}")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        plt.colorbar(im, ax=ax, label="Intensity")
+        plt.tight_layout()
+
+        def update_image(img_idx, vmin, vmax):
+            im.set_data(img_list[img_idx])
+            im.set_clim(vmin, vmax)
+            ax.set_title(f"Coherent Image  {img_idx}/{num_images - 1}")
+            fig.canvas.draw_idle()
+
+        display(widgets.interactive(update_image, img_idx=img_slider, vmin=vmin_box, vmax=vmax_box))
 
 
-def plot_averag_coh_imgs(roi: ROI, vmin=None, vmax=None, cmap='viridis', title=None):
-    """Plot the average of `roi.coherent_imgs` with scan-axis labels."""
-    avg = roi.averaged_coherent_images
+def plot_averag_coh_imgs(roi: ROI, vmin: float | None = None, vmax: float | None = None,
+                         cmap: str = 'viridis', title: str | None = None,
+                         use_positions: bool = False):
+    """Plot the average of `roi.coherent_imgs` with scan-axis labels.
+
+    Args:
+        use_positions: If True, label axes with motor positions in nm instead
+                       of generic 'Scan-X / Scan-Y' labels.
+    """
+    avg = roi.summed_coherent_images
     if title is None:
         title = f"Average Coherent Images: Scan {roi.scan_num}"
 
-    if roi.slow_axis == 'scan_x':
-        x_label, y_label = 'Scan-X: Slow Axis', 'Scan-Y: Fast Axis'
+    # Resolve extent and axis labels
+    if use_positions:
+        extent, xlabel, ylabel = _scan_extent(roi)
     else:
-        x_label, y_label = 'Scan-X: Fast Axis', 'Scan-Y: Slow Axis'
+        extent = None
 
-    plt.figure()
-    plt.imshow(avg, vmin=vmin, vmax=vmax, cmap=cmap)
-    plt.title(title)
-    plt.xlabel(x_label)
-    plt.ylabel(y_label)
-    plt.colorbar()
+    if extent is None:
+        if getattr(roi, 'slow_axis', None) == 'scan_x':
+            xlabel, ylabel = 'Scan-X: Slow Axis', 'Scan-Y: Fast Axis'
+        else:
+            xlabel, ylabel = 'Scan-X: Fast Axis', 'Scan-Y: Slow Axis'
+
+    # Build imshow kwargs to avoid passing None for typed parameters
+    ikw: dict[str, Any] = {"cmap": cmap}
+    if vmin is not None:
+        ikw["vmin"] = vmin
+    if vmax is not None:
+        ikw["vmax"] = vmax
+    if extent is not None:
+        ikw["extent"] = extent
+
+    _, ax = plt.subplots()
+    im = ax.imshow(avg, **ikw)
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    plt.colorbar(im, ax=ax)
     plt.show()
 
+def plot_tilt_corrected_image(roi: ROI, vmin: float | None = None, vmax: float | None = None,
+                         cmap: str = 'viridis', title: str | None = None,
+                         use_positions: bool = False):
+    """Plot the average of `roi.coherent_imgs` with scan-axis labels.
 
+    Args:
+        use_positions: If True, label axes with motor positions in nm instead
+                       of generic 'Scan-X / Scan-Y' labels.
+    """
+    if roi.tilt_corrected_image is None: 
+        tilt_correct(roi = roi, iters = 3)
+    
+    avg = roi.tilt_corrected_image
+        
+    if title is None:
+        title = f"Average Coherent Images: Scan {roi.scan_num}"
+
+    # Resolve extent and axis labels
+    if use_positions:
+        extent, xlabel, ylabel = _scan_extent(roi)
+    else:
+        extent = None
+
+    if extent is None:
+        if getattr(roi, 'slow_axis', None) == 'scan_x':
+            xlabel, ylabel = 'Scan-X: Slow Axis', 'Scan-Y: Fast Axis'
+        else:
+            xlabel, ylabel = 'Scan-X: Fast Axis', 'Scan-Y: Slow Axis'
+
+    # Build imshow kwargs to avoid passing None for typed parameters
+    ikw: dict[str, Any] = {"cmap": cmap}
+    if vmin is not None:
+        ikw["vmin"] = vmin
+    if vmax is not None:
+        ikw["vmax"] = vmax
+    if extent is not None:
+        ikw["extent"] = extent
+
+    _, ax = plt.subplots()
+    im = ax.imshow(avg, **ikw)
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    plt.colorbar(im, ax=ax)
+    plt.show()
 def plot_detected_objects(roi: ROI):
     """Interactive slider viewer for `roi.detected_objects`."""
     img_list   = roi.detected_objects
@@ -250,17 +455,63 @@ def plot_calculated_kins(roi: ROI, pupil_roi: ROI,
                          vmin=None, vmax=None,
                          title="Mapped kins onto pupil",
                          cmap="viridis"):
-    """Overlay `roi.kin_coords` onto the pupil averaged detector image."""
-    plot_map_on_detector(
-        pupil_roi.averaged_det_images, roi.kin_coords,
-        vmin, vmax, title, cmap, crop=False, roi=pupil_roi.coords,
-    )
+    """Overlay `roi.kin_coords` onto the pupil averaged detector image.
+
+    For multi-streak ROIs (kin_coords is a list) an interactive Streak slider
+    is shown so each streak's kin positions can be inspected individually.
+    """
+    if isinstance(roi.kin_coords, list):
+        n_streaks     = len(roi.kin_coords)
+        streak_slider = widgets.IntSlider(min=0, max=n_streaks - 1, value=0, description="Streak")
+        out           = widgets.Output()
+
+        def _render(change=None):
+            with out:
+                out.clear_output(wait=True)
+                s = streak_slider.value
+                plot_map_on_detector(
+                    pupil_roi.averaged_det_images, roi.kin_coords[s],
+                    vmin, vmax, f"{title} — Streak {s}", cmap,
+                    crop=False, roi=pupil_roi.coords,
+                )
+
+        streak_slider.observe(_render, names='value')
+        _render()
+        display(widgets.VBox([streak_slider, out]))
+    else:
+        plot_map_on_detector(
+            pupil_roi.averaged_det_images, roi.kin_coords,
+            vmin, vmax, title, cmap, crop=False, roi=pupil_roi.coords,
+        )
 
 
 def plot_kouts(roi: ROI, vmin=None, vmax=None,
                title="Mapped kouts", cmap="viridis"):
-    """Overlay `roi.kout_coords` onto the ROI averaged detector image."""
-    plot_map_on_detector(
-        roi.averaged_det_images, roi.kout_coords,
-        vmin, vmax, title, cmap, crop=False, roi=roi.coords,
-    )
+    """Overlay `roi.kout_coords` onto the ROI averaged detector image.
+
+    For multi-streak ROIs (kout_coords is a list) an interactive Streak slider
+    is shown so each streak can be inspected individually.
+    """
+    if isinstance(roi.kout_coords, list):
+        n_streaks     = len(roi.kout_coords)
+        streak_slider = widgets.IntSlider(min=0, max=n_streaks - 1, value=0, description="Streak")
+        out           = widgets.Output()
+
+        def _render(change=None):
+            with out:
+                out.clear_output(wait=True)
+                s = streak_slider.value
+                plot_map_on_detector(
+                    roi.averaged_det_images, roi.kout_coords[s],
+                    vmin, vmax, f"{title} — Streak {s}", cmap,
+                    crop=False, roi=roi.coords,
+                )
+
+        streak_slider.observe(_render, names='value')
+        _render()
+        display(widgets.VBox([streak_slider, out]))
+    else:
+        plot_map_on_detector(
+            roi.averaged_det_images, roi.kout_coords,
+            vmin, vmax, title, cmap, crop=False, roi=roi.coords,
+        )

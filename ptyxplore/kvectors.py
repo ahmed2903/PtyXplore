@@ -166,6 +166,351 @@ def optimise_kin_w_geometry(G_init, det_distance_init, kin_pixels, kout_pixels, 
     return kin_opt, kouts, kins, optimal_params
 
 
+def _extent_projection(kouts, pupil_kbounds):
+    """
+    Closed-form G_xy from the streak extent constraint.
+
+    The streak in kout space is a rigid shift of the pupil by G, so the
+    centre of the streak in x/y equals the centre of the pupil plus G_xy.
+    """
+    kx_min, kx_max, ky_min, ky_max = pupil_kbounds
+    G_x = (kouts[:, 0].max() + kouts[:, 0].min()) / 2 - (kx_max + kx_min) / 2
+    G_y = (kouts[:, 1].max() + kouts[:, 1].min()) / 2 - (ky_max + ky_min) / 2
+    return np.array([G_x, G_y])
+
+
+def _elastic_z(kouts, G_xy, k):
+    """
+    G_z from the elastic-scattering condition |kin| = k, evaluated per pixel.
+
+    kin_z = sqrt(k^2 - |kin_xy|^2),  G_z = median(kout_z - kin_z).
+    Median is used for robustness against outlier pixels.
+    """
+    kin_xy = kouts[:, :2] - G_xy
+    kin_z = np.sqrt(np.maximum(0.0, k ** 2 - np.sum(kin_xy ** 2, axis=1)))
+    return float(np.median(kouts[:, 2] - kin_z))
+
+
+def _ttheta_z(G_xy, k, ttheta, G_z_sign):
+    """
+    G_z from the 2theta constraint: |G| = 2k sin(ttheta/2).
+
+    Returns None when the current G_xy already exceeds the target |G|,
+    in which case the caller falls back to the elastic estimate.
+    """
+    G_mag_target = 2.0 * k * np.sin(ttheta / 2.0)
+    G_z_sq = G_mag_target ** 2 - float(np.dot(G_xy, G_xy))
+    if G_z_sq < 0:
+        return None
+    return G_z_sign * np.sqrt(G_z_sq)
+
+
+def _pupil_clamp_G(kouts, G, pupil_kbounds):
+    """
+    Projection onto the pupil-support constraint in G-space.
+
+    For all kins = kout - G to lie inside the pupil box, G must satisfy:
+        max(kout_x) - kx_max  <=  G_x  <=  min(kout_x) - kx_min
+    (and similarly for y).  We clamp G_xy to this feasible interval.
+    """
+    kx_min, kx_max, ky_min, ky_max = pupil_kbounds
+    G_clamped = G.copy()
+    G_clamped[0] = np.clip(G[0],
+                            kouts[:, 0].max() - kx_max,
+                            kouts[:, 0].min() - kx_min)
+    G_clamped[1] = np.clip(G[1],
+                            kouts[:, 1].max() - ky_max,
+                            kouts[:, 1].min() - ky_min)
+    return G_clamped
+
+
+def _ewald_circle_projection(kouts, G, k):
+    """
+    Project each kin_j = kout_j - G onto the Ewald circle for this streak.
+
+    The Ewald circle is the intersection of:
+      - Elastic sphere : |kin| = k
+      - Bragg plane    : G · kin = -|G|^2 / 2
+        (derived from |kin+G|^2 = k^2 and |kin|^2 = k^2)
+
+    Algorithm per pixel j:
+      1. Compute kin_j = kout_j - G.
+      2. Remove the excess component along G so that G · kin = -|G|^2 / 2.
+      3. Scale the result to lie on the sphere |kin| = k.
+
+    After projection: |kin_j_proj| = k and G · kin_j_proj = -|G|^2 / 2 exactly.
+
+    Returns
+    -------
+    kins_proj : (N, 3) — projected incident k-vectors with |kin| = k.
+    """
+    G_sq = np.dot(G, G)
+    if G_sq < 1e-30:
+        return kouts - G  # G ≈ 0 — degenerate, return raw difference
+
+    kins = kouts - G  # (N, 3) current estimate
+
+    # Step 1: project onto the Bragg plane  G · kin = -|G|^2 / 2
+    dot_G_kin = kins @ G                        # (N,)
+    excess = (dot_G_kin + G_sq / 2.0) / G_sq   # (N,)
+    kins_plane = kins - excess[:, np.newaxis] * G  # (N, 3)
+
+    # Step 2: scale to the elastic sphere radius k
+    norms = np.linalg.norm(kins_plane, axis=1, keepdims=True)
+    norms = np.where(norms < 1e-30, 1.0, norms)
+    kins_proj = k * kins_plane / norms          # |kin_proj| = k
+
+    return kins_proj
+
+
+def _project_single_streak(kouts, pupil_kbounds, k, n_inner,
+                            clamp_to_pupil=False, G_init=None):
+    """
+    Alternating projections for one streak.
+
+    Each inner iteration:
+      1. Ewald circle projection  → kins  (enforces |kin| = k AND G·kin = -|G|²/2)
+      2. G update                 → G = mean(kouts - kins_proj)
+      3. Pupil-support clamp      → G_xy  (optional; only when clamp_to_pupil=True)
+
+    After the loop a final Ewald projection is applied so the returned kins
+    satisfy |kin| = k exactly regardless of how many inner iterations were run.
+
+    Parameters
+    ----------
+    G_init : (3,) array or None
+        Starting G vector.  Pass roi.g_init (from a prior optimise_kin call)
+        for best results.  If None, G is bootstrapped from the elastic-z
+        estimate with G_xy = 0 — only G_z will be meaningful in that case.
+
+    Returns
+    -------
+    G           : (3,) refined scattering vector for this streak
+    kins        : (N, 3) incident k-vectors with |kin| = k
+    width_ratio : (2,) streak_width / pupil_width in x and y  (should be ~1)
+    """
+    if G_init is not None:
+        G = np.array(G_init, dtype=float).ravel()
+    else:
+        G = np.zeros(3)
+        G[2] = _elastic_z(kouts, G[:2], k)
+    for _ in range(n_inner):
+        # 1. Project kins onto the Ewald circle for current G → |kin| = k
+        kins = _ewald_circle_projection(kouts, G, k)
+        # 2. Update G as the mean residual kout - kin_proj
+        G = np.mean(kouts - kins, axis=0)
+        # 3. Optionally clamp G_xy to keep all kins inside the pupil box
+        if clamp_to_pupil:
+            G = _pupil_clamp_G(kouts, G, pupil_kbounds)
+
+    # Final Ewald projection: guarantees |kin| = k on exit
+    kins = _ewald_circle_projection(kouts, G, k)
+    # Recompute G consistently with the projected kins
+    G = np.mean(kouts - kins, axis=0)
+
+    kx_min, kx_max, ky_min, ky_max = pupil_kbounds
+    width_ratio = np.array([
+        (kouts[:, 0].max() - kouts[:, 0].min()) / max(kx_max - kx_min, 1e-30),
+        (kouts[:, 1].max() - kouts[:, 1].min()) / max(ky_max - ky_min, 1e-30),
+    ])
+
+    return G, kins, width_ratio
+
+
+def projection_kin_refinement(
+    kouts_list,
+    pupil_kbounds,
+    wavelength,
+    n_iterations=5,
+    n_inner=3,
+    clamp_to_pupil=False,
+    G_init_list=None,
+):
+    """
+    Projection-based solver for kin vectors across multiple streaks.
+
+    Each streak has its own scattering vector G_s; all streaks share the same
+    pupil aperture.  Per inner iteration the algorithm:
+
+      1. Projects kins onto the Ewald circle for current G  (enforces |kin| = k)
+      2. Updates G = mean(kouts - kins_proj)
+      3. Optionally clamps G_xy to the pupil-support feasible interval
+
+    The outer loop tracks convergence via dG and allows the caller to update
+    kouts_list externally (e.g. after geometry refinement) and re-enter.
+
+    Parameters
+    ----------
+    kouts_list     : list of (N_s, 3) arrays — k-out vectors per streak
+    pupil_kbounds  : (kx_min, kx_max, ky_min, ky_max) — pupil aperture in k-space
+    wavelength     : X-ray wavelength (same units as the k-vectors)
+    n_iterations   : outer iteration count
+    n_inner        : inner Ewald-projection steps per streak per outer iteration
+    clamp_to_pupil : if True, clamp G_xy so all implied kins stay inside the
+                     pupil box after each Ewald step (only reliable when
+                     width_ratio ≈ 1; leave False to preserve delta_q)
+    G_init_list    : list of (3,) initial G vectors, one per streak, or None.
+                     Provide roi.g_init / roi.g_list from a prior optimise_kin
+                     call for best convergence.  If None, G is bootstrapped
+                     from the elastic-z estimate with G_xy = 0.
+
+    Returns
+    -------
+    G_list       : list of (3,) G vectors, one per streak
+    kins_list    : list of (N_s, 3) kin arrays with |kin| = k, one per streak
+    width_ratios : (n_streaks, 2) streak_width / pupil_width — should be ~1.0
+    history      : list of per-iteration dicts with keys
+                   'iteration', 'G_list', 'width_ratios', 'dG'
+    """
+    k = 2.0 * np.pi / wavelength
+    n_streaks = len(kouts_list)
+
+    if G_init_list is not None and len(G_init_list) != n_streaks:
+        raise ValueError(
+            f"G_init_list has {len(G_init_list)} entries but kouts_list has {n_streaks}"
+        )
+
+    # Seed G_list from G_init_list so each outer iteration refines the G
+    # produced by the previous one rather than restarting from scratch.
+    if G_init_list is not None:
+        G_list = [np.array(G_init, dtype=float).ravel() for G_init in G_init_list]
+    else:
+        G_list = [np.zeros(3) for _ in range(n_streaks)]
+
+    kins_list = [None] * n_streaks
+    width_ratios = np.zeros((n_streaks, 2))
+    history = []
+    print(n_iterations)
+    for iteration in range(n_iterations):
+        if iteration % 100 == 0:
+            print(iteration)
+        G_prev = [G.copy() for G in G_list]
+
+        for s in range(n_streaks):
+            # Pass the current best G so outer iterations genuinely refine it.
+            G, kins, wr = _project_single_streak(
+                kouts_list[s], pupil_kbounds, k, n_inner,
+                clamp_to_pupil, G_list[s],
+            )
+            G_list[s] = G
+            kins_list[s] = kins
+            width_ratios[s] = wr
+
+        dG = max(np.linalg.norm(G_list[s] - G_prev[s]) for s in range(n_streaks))
+
+        history.append({
+            'iteration': iteration + 1,
+            'G_list': [G.copy() for G in G_list],
+            'width_ratios': width_ratios.copy(),
+            'dG': dG,
+        })
+
+        if dG < 1e-12:
+            break
+
+    return G_list, kins_list, width_ratios, history
+
+
+def iterate_kin_refinement(
+    G_init,
+    det_distance_init,
+    kin_pixels,
+    kout_pixels,
+    ttheta,
+    wavelength,
+    pixel_size,
+    central_pixel,
+    n_iterations=5,
+    method='BFGS',
+    gtol=1e-6,
+    reestimate_ttheta=False,
+):
+    """
+    Alternates between geometry refinement (detector distance + orientation)
+    and 2theta/angle refinement until n_iterations is reached.
+
+    Each cycle:
+      1. optimise_kin_w_geometry — refines det_distance and G orientation
+         using elastic / pupil-support constraints.
+      2. optimise_kin — refines G orientation using the 2theta dot-product
+         objective, working with the updated k-vectors from step 1.
+
+    Args:
+        G_init:            Initial G vector (3,).
+        det_distance_init: Initial detector distance (same units as pixel_size).
+        kin_pixels:        (N, 2) pixel coordinates of incident beam pixels.
+        kout_pixels:       (M, 2) pixel coordinates of diffracted beam pixels.
+        ttheta:            Two-theta angle in radians.
+        wavelength:        X-ray wavelength (same units as pixel_size / distance).
+        pixel_size:        Detector pixel size.
+        central_pixel:     (row, col) of the beam centre on the detector.
+        n_iterations:      Number of geometry ↔ angle cycles to run.
+        method:            scipy.optimize.minimize method string.
+        gtol:              Gradient tolerance for both optimisers.
+        reestimate_ttheta: If True, re-derive ttheta from the current k-vectors
+                           after each geometry step (uses estimate_ttheta).
+
+    Returns:
+        kin_opt:        Final refined k_in vectors (M, 3).
+        kouts:          Final k_out vectors (M, 3).
+        kins_pupil:     Final pupil k_in vectors (N, 3).
+        G_opt:          Final refined G vector (3,).
+        det_distance:   Final refined detector distance.
+        history:        List of dicts with per-iteration diagnostics.
+    """
+    G_current = np.array(G_init, dtype=float)
+    det_distance = float(det_distance_init)
+    current_ttheta = float(ttheta)
+    history = []
+
+    for i in range(n_iterations):
+        # --- Step 1: geometry refinement ---
+        kin_opt, kouts, kins_pupil, geo_params = optimise_kin_w_geometry(
+            G_current,
+            det_distance,
+            kin_pixels,
+            kout_pixels,
+            wavelength,
+            pixel_size,
+            central_pixel,
+            method,
+            gtol,
+        )
+        det_distance = float(geo_params[0])
+        geo_angles = geo_params[1:]
+        G_current = rotation_matrix(*geo_angles) @ G_current
+
+        if reestimate_ttheta:
+            current_ttheta = np.deg2rad(estimate_ttheta(kouts, kins_pupil))
+
+        # --- Step 2: 2theta / angle refinement ---
+        kin_opt, angle_angles = optimise_kin(
+            G_current,
+            current_ttheta,
+            kouts,
+            wavelength,
+            method,
+            gtol,
+        )
+        G_current = rotation_matrix(*angle_angles) @ G_current
+
+        history.append({
+            'iteration': i + 1,
+            'det_distance': det_distance,
+            'ttheta_rad': current_ttheta,
+            'G': G_current.copy(),
+            'geo_angles': geo_angles,
+            'angle_angles': angle_angles,
+        })
+
+    # Recompute final k-vectors with the converged detector distance
+    kouts = compute_vectors(kout_pixels, det_distance, pixel_size, central_pixel, wavelength)
+    kins_pupil = compute_vectors(kin_pixels, det_distance, pixel_size, central_pixel, wavelength)
+    kin_opt = kouts - G_current
+
+    return kin_opt, kouts, kins_pupil, G_current, det_distance, history
+
+
 def calc_qvec(kout, kin, **kwargs):
     """
     optional args:
