@@ -86,7 +86,8 @@ class Scan:
             self.det_psize = 75 * ut.UNIT_MAP['um']
         elif self.detector == "Lambda":
             self.det_psize = 55 * ut.UNIT_MAP['um']
-
+        
+        
         
         # ----------------------------
         # Parse Log File
@@ -130,6 +131,7 @@ class Scan:
             self.wavelength = f["/entry/instrument/beam/incident_wavelength"][...] * ut.UNIT_MAP['Angs']
             self.energy = ut.wavelength2energy(self.wavelength)
 
+        
     
     def __repr__(self):
         class_name = type(self).__name__
@@ -171,6 +173,12 @@ class ROI:
     _averaged_det_images: np.ndarray = field(default=None, repr=False)  # Average of all detector frames 
     _averaged_coherent_images: np.ndarray = field(default=None, repr=False)
     _summed_coherent_images: np.ndarray = field(default=None, repr=False)
+    _delta_qz : float = field(default = 0.0, repr = True)
+    _delta_q : float = field(default = 0.0, repr = True)
+    _ttheta : float = field(default = 0.0, repr = True)
+    _det_psize_eff : float = field(default = None, repr = True)
+    _dz  : float = field(default = 0.0, repr = True)
+    
     tilt_corrected_image : np.ndarray = field(default=None, repr = False)
     
     # Data
@@ -189,7 +197,7 @@ class ROI:
     optimal_angles: list = field(default=None, repr=False)  # Euler angles that rotate Kout to Kin
     est_ttheta: float = field(default=None, repr=False)
     g_init: np.ndarray = field(default=None, repr=False)  # Initial G vector for a Signal
-        
+    
     log_params: list = field(default_factory=list, repr = False)
     
     checkpoint_stack:list = field(default_factory=list, repr = False)
@@ -253,6 +261,45 @@ class ROI:
     def update_summed_coherent_images(self):
         self._summed_coherent_images = np.sum(self.data_4d, axis=(2,3))
 
+    @property
+    def ttheta(self):
+        return self._ttheta
+    @ttheta.setter
+    def ttheta(self, value):
+        self._ttheta = value
+        
+    @property
+    def delta_qz(self):
+        return self._delta_qz
+        
+    @delta_qz.setter
+    def delta_qz(self, value):
+        self._delta_qz = value
+
+    @property
+    def delta_q(self):
+        return self._delta_q
+        
+    @delta_q.setter
+    def delta_q(self, value):
+        self._delta_q = value
+
+    @property
+    def det_psize_eff(self):
+        return self._det_psize_eff
+            
+    @det_psize_eff.setter
+    def det_psize_eff(self, value):
+        self._det_psize_eff = value
+
+    @property
+    def dz(self):
+        return self._dz
+            
+    @dz.setter
+    def dz(self, value):
+        self._dz = value
+    
     # _______________ Arithmetic _______________
 
     def __add__(self, other):
@@ -357,11 +404,18 @@ class ROI:
             exp_params.attrs['step_size_y'] = self.step_size_y
             exp_params.attrs['slow_axis'] = self.slow_axis
             exp_params.attrs['detector'] = self.detector
+            exp_params.attrs['delta_q'] = self.delta_q
+            exp_params.attrs['delta_qz'] = self.delta_qz
+            exp_params.attrs['ttheta'] = self.ttheta
+            
             
             process_params = h5f.create_group("processing_params")
             
             process_params.attrs['roi'] = str(self.coords)
             process_params.attrs['det_distance'] = self.det_distance
+            process_params.attrs['delta_q'] = self.delta_q
+            process_params.attrs['delta_qz'] = self.delta_qz
+            process_params.attrs['dz'] = self.dz
             
             images = h5f.create_group("processed_images")
             _save_streakable(images, "coherent_images", self.coherent_imgs)
@@ -424,9 +478,14 @@ class ROI:
             self.step_size_y = params.attrs['step_size_y']
             self.slow_axis = params.attrs['slow_axis']
 
+            
             params = h5f["processing_params"]
-            self.det_distance = params.attrs['det_distance'] 
-
+            self.det_distance = params.attrs.get('det_distance')
+            
+            self.dz = params.attrs.get("dz")
+            self.delta_qz = params.attrs.get("delta_qz")
+            self.delta_q = params.attrs.get("delta_q")
+            
             images = h5f["processed_images"]
             self.coherent_imgs = _load_streakable(images, "coherent_images")
 

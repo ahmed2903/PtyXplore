@@ -57,3 +57,21 @@ def estimate_detector_distance_from_NA(NA, pupil_size):
 def calculate_NA(focal_length, height):
 
     return np.sin(np.arctan(height/(2*focal_length)))
+
+def calculate_delta_qz(ttheta, det_distance, wavelength, det_psize):
+    """
+    ttheta (rad)
+    det_distance (nm)
+    wavlength (nm^-1)
+    det_psize (nm)
+    """
+    return 2*np.pi * det_psize * np.cos(ttheta)**2 * np.sin(ttheta) / (wavelength * det_distance)
+
+def calculate_delta_q(ttheta, det_distance, wavelength, det_psize):
+    """
+    ttheta (rad)
+    det_distance (nm)
+    wavlength (nm^-1)
+    det_psize (nm)
+    """
+    return 2*np.pi * det_psize * np.cos(ttheta)**2 * np.cos(ttheta/2) / (wavelength * det_distance)

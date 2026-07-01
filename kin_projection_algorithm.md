@@ -143,6 +143,18 @@ In G-space this translates to a feasible interval for $G_s^x$ (and identically f
 
 $$\max_j k_{out,j}^x - k_x^{\max} \;\le\; G_s^x \;\le\; \min_j k_{out,j}^x - k_x^{\min}.$$
 
+### C7 — Coplanarity (multi-streak coupling)
+
+All scattering vectors $\{\mathbf{G}_s\}$ from the same crystal arise from the same set of
+lattice planes and therefore lie in a common **scattering plane** through the origin.
+Denoting the unit normal to this plane as $\hat{\mathbf{n}}$:
+
+$$\hat{\mathbf{n}} \cdot \mathbf{G}_s = 0 \quad \forall\, s.$$
+
+This is a **coupling constraint** — it links all streaks simultaneously and cannot be
+enforced per-streak. It requires at least 3 streaks to be non-trivial (any 2 vectors
+trivially lie in a common plane through the origin).
+
 ---
 
 ## Ewald Circle Projection (`_ewald_circle_projection`)
@@ -227,28 +239,39 @@ Iteration stops early if $\delta G < 10^{-12}$.
 ### Full algorithm schematic
 
 ```
-Input:  kouts_list   — list of (N_s, 3) arrays, one per streak
-        pupil_kbounds — (kx_min, kx_max, ky_min, ky_max)
+Input:  kouts_list       — list of (N_s, 3) arrays, one per streak
+        pupil_kbounds    — (kx_min, kx_max, ky_min, ky_max)
         wavelength
-        G_init_list  — (optional) list of (3,) initial G vectors from prior optimisation
+        G_init_list      — (optional) list of (3,) initial G vectors from prior optimisation
+        enforce_coplanar — (optional) enforce C7 across all streaks
 
 Initialise G_list from G_init_list (or elastic-z bootstrap if absent)
 
 for iteration = 1 … n_iterations:
 
-    for each streak s:
-        G ← G_list[s]                          ← carry forward from previous iteration
+    for each streak s:                                 ← per-streak, independent
+        G ← G_list[s]                                 ← carry forward
         for inner = 1 … n_inner:
             kins ← ewald_circle_projection(kouts_s, G, k)   # |kin| = k  (C2 + C4)
             G    ← mean(kouts_s − kins)                     # G update
-            [G_xy ← pupil_clamp(G_xy)]                      # C6, if clamp_to_pupil=True
+            [G_xy ← pupil_clamp(G_xy)]                      # C6, optional
         kins ← ewald_circle_projection(kouts_s, G, k)       # final projection
         G    ← mean(kouts_s − kins)                         # consistent G
+
+    if enforce_coplanar and n_streaks ≥ 3:             ← cross-streak coupling
+        n_hat ← smallest right singular vector of [G_1 | … | G_S]ᵀ
+        for each streak s:
+            G_s ← G_s − (n_hat · G_s) n_hat           # project onto scattering plane (C7)
 
     compute δG = max_s ‖G_s(t) − G_s(t-1)‖
     if δG < 1e-12: break
 
-Output: G_list, kins_list, width_ratios, history
+if enforce_coplanar:                                   ← final Ewald sync
+    for each streak s:
+        kins_s ← ewald_circle_projection(kouts_s, G_s, k)
+        G_s    ← mean(kouts_s − kins_s)
+
+Output: G_list, kins_list, width_ratios, history  (history includes plane_normal per iteration)
 ```
 
 ---
@@ -284,6 +307,36 @@ incremental difference $\Delta\mathbf{q} = \mathbf{k}_{in,j_1} - \mathbf{k}_{in,
 is preserved to leading order.  The Ewald projection introduces a small second-order
 correction to $\Delta\mathbf{q}$ that is proportional to $(\Delta\mathbf{k}_{out})^2 / k$
 and is negligible for narrow streaks (small pupil angle).
+
+---
+
+## Coplanar Projection (`_coplanar_projection`)
+
+Given $S \ge 3$ scattering vectors $\{\mathbf{G}_s\}$, find the plane through the origin
+that best contains them all and project each $\mathbf{G}_s$ onto it.
+
+**Best-fit plane normal via SVD.**  Stack the G vectors into a matrix:
+
+$$\mathbf{M} = \begin{pmatrix} \mathbf{G}_1^\top \\ \vdots \\ \mathbf{G}_S^\top \end{pmatrix} \in \mathbb{R}^{S \times 3}.$$
+
+The SVD $\mathbf{M} = \mathbf{U}\boldsymbol{\Sigma}\mathbf{V}^\top$ gives right singular vectors
+$\mathbf{v}_1, \mathbf{v}_2, \mathbf{v}_3$ ordered by decreasing singular value.  The smallest
+singular value corresponds to the direction that minimises the sum of squared projections of all
+$\mathbf{G}_s$ — i.e. the direction they are most orthogonal to.  The plane normal is:
+
+$$\hat{\mathbf{n}} = \mathbf{v}_3 \quad (\text{smallest right singular vector}).$$
+
+**Projection onto the plane.**  For each streak:
+
+$$\mathbf{G}_s^{\mathrm{proj}} = \mathbf{G}_s - (\hat{\mathbf{n}} \cdot \mathbf{G}_s)\,\hat{\mathbf{n}}.$$
+
+This removes the out-of-plane component while leaving the in-plane component unchanged.  When
+C7 is exactly satisfied, $\hat{\mathbf{n}} \cdot \mathbf{G}_s = 0$ for all $s$ and the
+projection is a no-op.
+
+**Placement in the outer loop.**  The coplanar projection is applied *after* all per-streak
+Ewald steps in each outer iteration.  Because it changes $\mathbf{G}_s$, the final iteration
+is followed by one additional Ewald projection to re-sync $\mathbf{k}_{in}$ with $|\mathbf{k}_{in}| = k$.
 
 ---
 

@@ -16,7 +16,7 @@ from .data_proc import *
 from .kvectors import (make_coordinates, compute_vectors, optimise_kin, optimise_kin_w_geometry,
                        reverse_kins_to_pixels, rotation_matrix, calc_qvec, extract_parallel_line,
                        extract_streak_region, compute_k_bounds,
-                       projection_kin_refinement, iterate_kin_refinement)
+                       projection_kin_refinement, iterate_kin_refinement, calculate_delta_qz, calculate_delta_q, calc_effective_pixel_size, extract_qz_streaks)
 
 from .utils import time_it, log_roi_params
 from .geometry import *
@@ -348,6 +348,10 @@ def make_kouts( roi:ROI, mask_val):
                                                             mask_val, 
                                                             roi.coords, 
                                                             crop=False)
+
+
+
+    
     if roi.centre_pixel is None and roi.kind == 'pupil':
         roi.centre_pixel = np.array([(roi.kout_coords[:,0].max() + roi.kout_coords[:,0].min() )/2, (roi.kout_coords[:,1].max() + roi.kout_coords[:,1].min() )/2])
 
@@ -426,7 +430,7 @@ def compute_kins(roi: ROI, pupil_roi: ROI, est_ttheta, method="BFGS", gtol=1e-6)
         angles_list.append(angles_s)
 
     if multi:
-        roi.g_init = g_inits
+        roi.g_vectors = g_inits
         roi.kins = kins_list
         roi.optimal_angles = angles_list
         roi.kin_coords = [
@@ -434,7 +438,7 @@ def compute_kins(roi: ROI, pupil_roi: ROI, est_ttheta, method="BFGS", gtol=1e-6)
             for kins_s in kins_list
         ]
     else:
-        roi.g_init = g_inits[0]
+        roi.g_vectors = g_inits[0]
         roi.kins = kins_list[0]
         roi.optimal_angles = angles_list[0]
         roi.kin_coords = reverse_kins_to_pixels(
@@ -469,11 +473,12 @@ def compute_kins_w_geometry(roi: ROI, pupil_roi: ROI, method="BFGS", gtol=1e-6):
 
     for kouts_s, kout_coords_s in zip(kouts_list, kout_coords_list):
         g_init_s = calc_qvec(kouts_s, pupil_roi.kins_avg)
+        
         kins_s, kouts_s_new, kins_pupil_s, params_s = optimise_kin_w_geometry(
-            g_init_s, roi.det_distance,
-            pupil_roi.kin_coords, kout_coords_s,
-            roi.wavelength, roi.det_psize, roi.centre_pixel,
-            method, gtol,
+            G_init =g_init_s, det_distance_init = roi.det_distance,
+            kin_pixels = pupil_roi.kin_coords, kout_pixels = kout_coords_s,
+            wavelength = roi.wavelength, pixel_size = roi.det_psize, central_pixel = roi.centre_pixel,
+            method=method, gtol= gtol,
         )
         g_inits.append(g_init_s)
         kins_list.append(kins_s)
@@ -510,14 +515,19 @@ def compute_kins_w_geometry(roi: ROI, pupil_roi: ROI, method="BFGS", gtol=1e-6):
 @log_roi_params
 @time_it
 def compute_kins_projection(roi: ROI, pupil_roi: ROI,
-                            n_iterations=5, n_inner=3, clamp_to_pupil=False):
+                            n_iterations=5, n_inner=3, clamp_to_pupil=False,
+                            enforce_coplanar=False, ttheta=None):
     """
     Refine kins for one or multiple streaks using Ewald-circle projection.
 
     Per inner iteration:
       1. Project kins onto the Ewald circle for current G  (enforces |kin| = k)
       2. Update G = mean(kouts - kins_proj)
-      3. Optionally clamp G_xy to the pupil-support feasible interval
+      3. Optionally rescale G to enforce |G| = 2k sin(ttheta/2)  (C3)
+      4. Optionally clamp G_xy to the pupil-support feasible interval
+
+    After all per-streak steps, optionally apply a coplanar projection across
+    all streaks (see enforce_coplanar).
 
     Handles both single-streak ROIs (roi.kouts is an (N,3) array) and
     multi-streak ROIs produced by make_parallel_streaks (roi.kouts is a list
@@ -528,18 +538,29 @@ def compute_kins_projection(roi: ROI, pupil_roi: ROI,
 
     Parameters
     ----------
-    roi            : ROI whose kouts will be used as the streak k-vectors.
-    pupil_roi      : ROI whose kouts define the pupil aperture bounds.
-    n_iterations   : outer alternating-projection iterations.
-    n_inner        : inner Ewald-projection steps per streak per outer iteration.
-    clamp_to_pupil : if True, additionally clamp G_xy so all implied kins lie
-                     inside the pupil box (only reliable when width_ratio ≈ 1).
+    roi              : ROI whose kouts will be used as the streak k-vectors.
+    pupil_roi        : ROI whose kouts define the pupil aperture bounds.
+    n_iterations     : outer alternating-projection iterations.
+    n_inner          : inner Ewald-projection steps per streak per outer iteration.
+    clamp_to_pupil   : if True, additionally clamp G_xy so all implied kins lie
+                       inside the pupil box (only reliable when width_ratio ≈ 1).
+    enforce_coplanar : if True, project all G_s onto their best-fit plane after
+                       each outer iteration, enforcing that all scattering vectors
+                       lie in the same crystallographic plane.  Requires at least
+                       3 streaks to be non-trivial; silently ignored otherwise.
+    ttheta           : two-theta angle(s) in radians.  A scalar is shared across
+                       all streaks; a list provides one value per streak.  When
+                       given, G is radially rescaled after each G update so that
+                       |G| = 2k sin(ttheta/2) is enforced (C3).  If None (default)
+                       the magnitude of G floats freely.  Use roi.est_ttheta
+                       (converted to radians) as a convenient source.
 
     Updates
     -------
     Single-streak: roi.kins (N,3), roi.g_init (3,), roi.kin_coords (N,2)
     Multi-streak : roi.kins (list), roi.g_list (list), roi.kin_coords (list)
     Always       : roi.width_ratios, roi.projection_history
+    Multi-streak + coplanar: roi.scattering_plane_normal (3,)
     """
     multi = isinstance(roi.kouts, list)
     kouts_list = roi.kouts if multi else [roi.kouts]
@@ -548,7 +569,10 @@ def compute_kins_projection(roi: ROI, pupil_roi: ROI,
     pupil_kbounds = (kx_min, kx_max, ky_min, ky_max)
 
     # Forward G initialisation from a prior compute_kins / compute_kins_w_geometry call.
-    g_init_attr = getattr(roi, 'g_list', None) or getattr(roi, 'g_init', None)
+    g_init_attr = getattr(roi, 'g_vectors', None)
+    
+    if g_init_attr is None:
+        g_init_attr = getattr(roi, 'g_vectors', None)
     if g_init_attr is not None:
         G_init_list = g_init_attr if isinstance(g_init_attr, list) else [g_init_attr]
         if len(G_init_list) != len(kouts_list):
@@ -558,22 +582,28 @@ def compute_kins_projection(roi: ROI, pupil_roi: ROI,
 
     G_list, kins_list, width_ratios, history = projection_kin_refinement(
         kouts_list, pupil_kbounds, roi.wavelength,
-        n_iterations, n_inner, clamp_to_pupil, G_init_list,
+        n_iterations, n_inner, clamp_to_pupil, G_init_list, enforce_coplanar,
+        ttheta_list=ttheta,
     )
+
+    # Store the final scattering plane normal if coplanar was applied
+    last = history[-1] if history else {}
+    if last.get('plane_normal') is not None:
+        roi.scattering_plane_normal = last['plane_normal']
 
     roi.width_ratios = width_ratios
     roi.projection_history = history
 
     if multi:
         roi.kins = kins_list
-        roi.g_list = G_list
+        roi.g_vectors = G_list
         roi.kin_coords = [
             reverse_kins_to_pixels(kins, roi.det_psize, roi.det_distance, roi.centre_pixel)
             for kins in kins_list
         ]
     else:
         roi.kins = kins_list[0]
-        roi.g_init = G_list[0]
+        roi.g_vectors = G_list[0]
         roi.kin_coords = reverse_kins_to_pixels(
             roi.kins, roi.det_psize, roi.det_distance, roi.centre_pixel
         )
@@ -687,13 +717,16 @@ def select_single_pixel_streak(roi:ROI, width=1, offset=0, inplace = False):
         inplace (bool): if True, it changes the kin_coords, kins, kouts, and kout_coords dict for that roi, if false, if returns the mask. (default = False)
 
     """
+
+    # mask = extract_parallel_line(roi.kouts[:,:2], width=width, offset=offset)
     mask = extract_parallel_line(roi.kouts[:,:2], width=width, offset=offset)
-    
     if inplace:
         roi.kins = roi.kins[mask]
         roi.kin_coords = roi.kin_coords[mask]
         roi.kouts = roi.kouts[mask]
         roi.kout_coords = roi.kout_coords[mask]
+        roi.g_vectors = roi.g_vectors[mask]
+        
         try:
             roi.coherent_imgs = roi.coherent_imgs[mask]
         except:
@@ -703,8 +736,12 @@ def select_single_pixel_streak(roi:ROI, width=1, offset=0, inplace = False):
     else:
         return mask
 
-def make_parallel_streaks(roi:ROI, width, extent, mask_thr = 0):
-    
+def make_parallel_streaks(roi:ROI, width= None, extent= None, mask_thr = 0):
+
+    if width is None: 
+        width = roi.delta_qz
+        extent = roi.delta_qz * 20 # 20 is a bit arbitrary 
+        
     offsets = np.arange(-extent,extent,width)
     masks = [select_single_pixel_streak(roi, width = width, offset = off, inplace = False) for off in offsets]
     masks_clean= [mask for mask in masks if np.sum(mask)>mask_thr]
@@ -714,8 +751,44 @@ def make_parallel_streaks(roi:ROI, width, extent, mask_thr = 0):
     roi.kouts = [roi.kouts[mask] for mask in masks_clean]
     roi.kin_coords = [roi.kin_coords[mask] for mask in masks_clean]
     roi.kout_coords = [roi.kout_coords[mask] for mask in masks_clean]
+
+def make_qz_streaks(roi, dqz=None, extent=None, min_pixels=5):
+    """
+    Split an ROI into constant-qz streaks.
+    """
+
+    if dqz is None:
+        dqz = roi.delta_qz
+
+    masks, edges = extract_qz_streaks(
+        roi.kouts,
+        dqz=dqz,
+        extent=extent,
+        min_pixels=min_pixels,
+    )
+
+    roi.coherent_imgs = [roi.coherent_imgs[m] for m in masks]
+    roi.kins          = [roi.kins[m] for m in masks]
+    roi.kouts         = [roi.kouts[m] for m in masks]
+    roi.kin_coords    = [roi.kin_coords[m] for m in masks]
+    roi.kout_coords   = [roi.kout_coords[m] for m in masks]
+
+    # if hasattr(roi, "g_vectors"):
+    #     roi.g_vectors = [roi.g_vectors[m] for m in masks]
+
+    roi.qz_edges = edges
+    roi.qz_masks = masks
+
+    Nz = len(masks)
+    roi.dz = None if Nz == 0 else 2 * np.pi / (dqz * Nz)
     
+def make_q_params(roi:ROI):
+
+    roi.det_psize_eff = calc_effective_pixel_size(roi.kouts, roi.det_psize)
+    roi.delta_q = calculate_delta_q(roi.ttheta, roi.det_distance, roi.wavelength, roi.det_psize_eff)
+    roi.delta_qz = calculate_delta_qz(roi.ttheta, roi.det_distance, roi.wavelength, roi.det_psize_eff)
     
+
 def select_streak_region(roi:ROI, percentage=10, start_position='lowest', start_idx=None, inplace = False):
     """
     Selects a region of the streak based on a percentage of its total size.
@@ -1022,19 +1095,23 @@ def flip_images(roi:ROI, flip_mode):
         np.ndarray: The transformed batch of images.
     """
     if flip_mode == "xy":
-        return roi.coherent_imgs  # No flip
+        return roi.coherent_imgs
     elif flip_mode == "x_neg_y":
-        return np.flip(roi.coherent_imgs, axis=1)  # Flip along y-axis
+        return [np.flip(img, axis=0) for img in roi.coherent_imgs]
     elif flip_mode == "neg_x_y":
-        return np.flip(roi.coherent_imgs, axis=2)  # Flip along x-axis
+        return [np.flip(img, axis=1) for img in roi.coherent_imgs]
     elif flip_mode == "neg_x_neg_y":
-        return np.flip(roi.coherent_imgs, axis=(1, 2))  # Flip along both axes
+        return [np.flip(img, axis=(0, 1)) for img in roi.coherent_imgs]
     else:
         raise ValueError(f"Invalid flip_mode: {flip_mode}")
 
 def tilt_correct(roi:ROI, iters = 3):
+    
+    ref = None
+    if roi.tilt_corrected_image is not None:
+        ref = roi.tilt_corrected_image
 
-    roi.tilt_corrected_image = tilt_correction(roi.coherent_imgs, roi.averaged_coherent_images, iters=iters)[0]
+    roi.tilt_corrected_image = tilt_correction(roi.coherent_imgs, ref, iters=iters)[0]
 
 def sum_line(args):
     file, dataset_key = args
