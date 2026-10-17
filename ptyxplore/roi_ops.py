@@ -16,7 +16,7 @@ from .data_proc import *
 from .kvectors import (make_coordinates, compute_vectors, optimise_kin, optimise_kin_w_geometry,
                        reverse_kins_to_pixels, rotation_matrix, calc_qvec, extract_parallel_line,
                        extract_streak_region, compute_k_bounds,
-                       projection_kin_refinement, iterate_kin_refinement, calculate_delta_qz, calculate_delta_q, calc_effective_pixel_size, extract_qz_streaks)
+                       projection_kin_refinement, iterate_kin_refinement, calculate_delta_qz, calculate_delta_q, calc_effective_pixel_size, extract_qz_streaks, estimate_ttheta)
 
 from .utils import time_it, log_roi_params
 from .geometry import *
@@ -322,19 +322,19 @@ def mask_region_detector(roi:ROI, region, mode = 'median'):
     sx,ex,sy,ey = region
     if mode == 'zeros':
         roi.data_4d[:,:,sx:ex,sy:ey] = 0.0
-        roi.update_averaged_det_images()
+        roi.invalidate_aggregates()
     elif mode == 'median':
         roi.data_4d[:,:,sx:ex,sy:ey] = np.median(roi.data_4d, axis = (2,3))[:,:,np.newaxis, np.newaxis]
-        roi.update_averaged_det_images()
+        roi.invalidate_aggregates()
     elif mode == 'ones':
         roi.data_4d[:,:,sx:ex,sy:ey] = 1.0
-        roi.update_averaged_det_images()
+        roi.invalidate_aggregates()
 
 
 ################### Compute k_in vectors ###################
 
 @log_roi_params
-def make_kouts( roi:ROI, mask_val):
+def make_kouts( roi:ROI, mask_val, pupil_roi:ROI = None):
     """Computes the k-space vectors for a given region of interest (ROI).
 
     Args:
@@ -342,6 +342,9 @@ def make_kouts( roi:ROI, mask_val):
                          k-space vectors are to be computed.
         mask_val (float): The value used for masking pixels during coordinate 
                           computation.
+        pupil_roi (ROI, optional): For a Bragg ROI, its centre_pixel is used so
+                          the kouts share a frame with the pupil kins. Run
+                          make_kouts on the pupil first.
 
     """
     roi.kout_coords = make_coordinates(roi.averaged_det_images, 
@@ -352,8 +355,16 @@ def make_kouts( roi:ROI, mask_val):
 
 
     
-    if roi.centre_pixel is None and roi.kind == 'pupil':
+    # centre_pixel defaults to (0, 0), so treat that as "not set" too
+    unset = roi.centre_pixel is None or np.all(np.asarray(roi.centre_pixel) == 0)
+    if unset and roi.kind == 'pupil':
         roi.centre_pixel = np.array([(roi.kout_coords[:,0].max() + roi.kout_coords[:,0].min() )/2, (roi.kout_coords[:,1].max() + roi.kout_coords[:,1].min() )/2])
+    elif roi.kind != 'pupil' and pupil_roi is not None:
+        # kouts and pupil kins must be in the same frame for G = kout - kin
+        if not np.allclose(roi.centre_pixel, pupil_roi.centre_pixel):
+            print(f"make_kouts: using pupil centre_pixel {pupil_roi.centre_pixel} "
+                  f"instead of {roi.centre_pixel}")
+        roi.centre_pixel = np.array(pupil_roi.centre_pixel)
 
     
     roi.kouts = compute_vectors(roi.kout_coords, 
@@ -369,7 +380,7 @@ def make_kouts( roi:ROI, mask_val):
         roi.kins_avg = np.mean(roi.kouts, axis = 0, keepdims = True )
 
 
-def estimate_ttheta(roi:ROI, pupil_roi:ROI):
+def estimate_ttheta_from_pupil(roi:ROI, pupil_roi:ROI):
     """Estiamtes the two theta value for the signal in the roi, assuming there is one incident wavevector which is specified by the average of all k_in vectors in the pupil. 
     Args:
         roi_name (str): The name of the region of interest (ROI) for which the two_theta value is to be estimated.
@@ -762,10 +773,16 @@ def make_qz_streaks(roi, dqz=None, extent=None, min_pixels=5):
 
     masks, edges = extract_qz_streaks(
         roi.kouts,
+        roi.kins,
         dqz=dqz,
         extent=extent,
         min_pixels=min_pixels,
     )
+
+    # edges covers every bin, including ones dropped by min_pixels, so keep the
+    # q_z of each kept streak separately (same q_z definition as extract_qz_streaks)
+    qz = roi.kouts[:, 2] - roi.kins[:, 2]
+    roi.qz_centres = np.array([qz[m].mean() for m in masks])
 
     roi.coherent_imgs = [roi.coherent_imgs[m] for m in masks]
     roi.kins          = [roi.kins[m] for m in masks]
@@ -779,11 +796,16 @@ def make_qz_streaks(roi, dqz=None, extent=None, min_pixels=5):
     roi.qz_edges = edges
     roi.qz_masks = masks
 
-    Nz = len(masks)
-    roi.dz = None if Nz == 0 else 2 * np.pi / (dqz * Nz)
+    # z sampling comes from the full q_z span, not the number of streaks that survived
+    Nz = len(edges) - 1
+    roi.dz = None if len(masks) == 0 else 2 * np.pi / (dqz * Nz)
     
 def make_q_params(roi:ROI):
-
+    try:
+        roi.ttheta = estimate_ttheta(roi.kouts, roi.kins)
+    except:
+        raise ValueError("couldn't calculate two theta")
+        
     roi.det_psize_eff = calc_effective_pixel_size(roi.kouts, roi.det_psize)
     roi.delta_q = calculate_delta_q(roi.ttheta, roi.det_distance, roi.wavelength, roi.det_psize_eff)
     roi.delta_qz = calculate_delta_qz(roi.ttheta, roi.det_distance, roi.wavelength, roi.det_psize_eff)
@@ -1059,14 +1081,14 @@ def mask_region_cohimgs(roi:ROI, region, mode = 'zeros'):
     roi.coherent_imgs = np.array(roi.coherent_imgs)
     if mode == 'zeros':
         roi.coherent_imgs[:,sx:ex,sy:ey] = 0.0
-        roi.update_averaged_coherent_images()
+        roi.averaged_coherent_images = np.mean(roi.coherent_imgs, axis = 0)
     elif mode == 'median':
         roi.coherent_imgs[:,sx:ex,sy:ey] = np.median(roi.coherent_imgs, 
                                                                     axis = (1,2))[:,np.newaxis, np.newaxis]
-        roi.update_averaged_coherent_images()
+        roi.averaged_coherent_images = np.mean(roi.coherent_imgs, axis = 0)
     elif mode == 'ones':
         roi.coherent_imgs[:,sx:ex,sy:ey] = 1.0
-        roi.update_averaged_coherent_images()
+        roi.averaged_coherent_images = np.mean(roi.coherent_imgs, axis = 0)
         
 def align_coherent_images(roi:ROI, ref_idx = None):
     """Aligns a list of coherent images for a given region of interest (ROI).
@@ -1164,7 +1186,7 @@ def sum_detector_frames(scan: Scan, detector = 'Eiger', plot=False, num_jobs = 3
     
     if plot:
         plt.figure()
-        plt.imshow(accumulator)
+        plt.imshow(accumulator, origin='lower')
         plt.title(f"Summed Detector Frames; Scan no. {scan.scan_num}")
         plt.show()
 
@@ -1213,7 +1235,7 @@ def std_detector_frames(scan: Scan, detector = 'Eiger', plot=False, num_jobs = 3
     
     if plot:
         plt.figure()
-        plt.imshow(accumulator)
+        plt.imshow(accumulator, origin='lower')
         plt.title(f"Summed Detector Frames; Scan no. {scan.scan_num}")
         plt.show()
 

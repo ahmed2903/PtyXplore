@@ -40,10 +40,10 @@ def align_images_from_shifts(images, shifts):
     
 def tilt_correction(images, tc_image = None, iters = 10):
 
-    Ncoh = images.shape[0]    
+    Ncoh = images.shape[0]
 
     if tc_image is None:
-        tc_image = images[Ncoh//2+1] 
+        tc_image = images[Ncoh//2] 
     
     for i in range(iters):
         

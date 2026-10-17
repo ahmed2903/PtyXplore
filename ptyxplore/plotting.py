@@ -27,7 +27,8 @@ def plot_roi_from_numpy(array, roi=None, name=None, vmin=None, vmax=None, save=F
         frame: (kwarg) frame index for 3D arrays.
     """
     if roi is None:
-        roi = [0, -1, 0, -1]
+        # None, not -1, so the last row and column are kept
+        roi = [None, None, None, None]
     if name is None:
         name = "Plot"
 
@@ -46,7 +47,7 @@ def plot_roi_from_numpy(array, roi=None, name=None, vmin=None, vmax=None, save=F
         vmax = me + 0.5 * me
 
     plt.figure()
-    plt.imshow(data_roi, vmin=vmin, vmax=vmax, cmap='viridis')
+    plt.imshow(data_roi, vmin=vmin, vmax=vmax, cmap='viridis', origin='lower')
     plt.title(name)
     plt.colorbar()
     plt.show()
@@ -119,11 +120,11 @@ def two_lists_one_slider(img_list1, img_list2,
     img_slider = widgets.IntSlider(min=0, max=num_images - 1, value=0, description="Image")
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-    im1 = axes[0].imshow(img_list1[0], vmin=vmin1, vmax=vmax1, cmap=cmap1)
+    im1 = axes[0].imshow(img_list1[0], vmin=vmin1, vmax=vmax1, cmap=cmap1, origin='lower')
     axes[0].set_title(f"Image 1  0/{num_images - 1}")
     plt.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
 
-    im2 = axes[1].imshow(img_list2[0], vmin=vmin2, vmax=vmax2, cmap=cmap2)
+    im2 = axes[1].imshow(img_list2[0], vmin=vmin2, vmax=vmax2, cmap=cmap2, origin='lower')
     axes[1].set_title(f"Image 2  0/{num_images - 1}")
     plt.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
     plt.tight_layout()
@@ -146,7 +147,7 @@ def plot_list_slider(img_list, scale_fac=0.3, vmin1=None, vmax1=None):
     img_slider = widgets.IntSlider(min=0, max=num_images - 1, value=0, description="Image")
 
     fig, ax = plt.subplots(figsize=(6, 6))
-    im = ax.imshow(img_list[0], cmap='viridis', vmin=vmin1, vmax=vmax1)
+    im = ax.imshow(img_list[0], cmap='viridis', vmin=vmin1, vmax=vmax1, origin='lower')
     ax.set_title(f"Image  0/{num_images - 1}")
     plt.colorbar(im, ax=ax, label="Intensity")
     plt.tight_layout()
@@ -177,7 +178,7 @@ def create_gif_from_arrays(array_list, gif_name, fps=10, cmap="viridis"):
     frame_files = []
     for i, array in enumerate(array_list):
         plt.figure(figsize=(6, 6))
-        plt.imshow(array, cmap=cmap)
+        plt.imshow(array, cmap=cmap, origin='lower')
         plt.colorbar()
         plt.title(f"Frame {i + 1}")
         frame_file = f"frame_{i}.png"
@@ -212,9 +213,9 @@ def two_lists_one_gif(array_list1, array_list2, gif_name,
     frame_files = []
     for i, (a1, a2) in enumerate(zip(array_list1, array_list2)):
         fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-        axes[0].imshow(a1, cmap=cmap)
+        axes[0].imshow(a1, cmap=cmap, origin='lower')
         axes[0].set_title(title1)
-        axes[1].imshow(a2, cmap=cmap)
+        axes[1].imshow(a2, cmap=cmap, origin='lower')
         axes[1].set_title(title2)
         fig.suptitle(f"Frame {i}/{num_images}", fontsize=16, y=1.05)
         frame_file = f"frame_{i}.png"

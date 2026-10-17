@@ -678,9 +678,9 @@ def reverse_kins_to_pixels(kins, pixel_size, detector_distance, central_pixel):
     row_pixels = (kins[:, 0] / kins[:, 2]) * detector_distance / pixel_size + cen_row
     col_pixels = (kins[:, 1] / kins[:, 2]) * detector_distance / pixel_size + cen_col
     
-    # Convert to integer pixel indices
-    row_pixel_indices = np.floor(row_pixels).astype(int)
-    col_pixel_indices = np.floor(col_pixels).astype(int)
+    # Convert to the nearest integer pixel indices
+    row_pixel_indices = np.rint(row_pixels).astype(int)
+    col_pixel_indices = np.rint(col_pixels).astype(int)
 
     coord = np.vstack((row_pixel_indices, col_pixel_indices)).T
 
@@ -833,49 +833,42 @@ def extract_parallel_line(kins, width=1, offset=0):
 
     return selected_mask
 
-import numpy as np
+def extract_qz_streaks(kouts, kins, dqz, extent=None, min_pixels=10):
+    """Group pixels into streaks by their Ewald q_z.
 
+    q_z = k_out,z - k_in,z - G_z is constant along a streak; k_out,z alone is not
+    (it also contains -|k_in|^2 / 2k_zG). G_z is a constant offset, so it is left
+    out here: it doesn't change the grouping, but an explicit ``extent`` must be
+    given without it too. kouts, kins and dqz must be in the same units (all
+    cycles/nm, or all rad/nm).
 
-def extract_qz_streaks(kouts, dqz, extent=None, min_pixels=5):
-    """
-    Split detector pixels into constant-qz streaks.
-
-    Parameters
-    ----------
-    kouts : (N,3) ndarray
-    dqz : float
-        Width of each qz bin.
-    extent : tuple(float,float), optional
-        (qz_min, qz_max). If None the full range is used.
-    min_pixels : int
-        Minimum number of pixels required for a streak.
-s
     Returns
     -------
     masks : list[np.ndarray]
-        Boolean masks for each streak.
+        Boolean masks for each streak with at least ``min_pixels`` pixels.
     edges : ndarray
-        Bin edges.
+        Edges of all bins, including the dropped ones, so ``len(edges) - 1`` can
+        exceed ``len(masks)``.
     """
-
-    k = np.linalg.norm(kouts[0])
-    qz = kouts[:, 2] - k
+    qz = kouts[:, 2] - kins[:, 2] #- G[2]
 
     if extent is None:
-        qz_min = qz.min()
-        qz_max = qz.max()
+        qz_min, qz_max = qz.min(), qz.max()
     else:
         qz_min, qz_max = extent
 
-    edges = np.arange(qz_min, qz_max + dqz, dqz)
+    # bins centred on the streak values, so rounding noise can't split a streak
+    n = int(np.round((qz_max - qz_min) / dqz)) + 1
+    edges = qz_min - dqz / 2 + np.arange(n + 1) * dqz
 
     masks = []
     for lo, hi in zip(edges[:-1], edges[1:]):
         mask = (qz >= lo) & (qz < hi)
-        masks.append(mask)
+        if mask.sum() >= min_pixels:
+            masks.append(mask)
 
     return masks, edges
-    
+
 def calc_angle(vec1, vec2):
     """
     The angle between two vectors

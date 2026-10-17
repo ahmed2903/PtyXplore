@@ -75,10 +75,10 @@ def plot_full_detector(roi: ROI, file_no, frame_no,
 
     data = mask_hot_pixels(data)
     fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-    im0 = axes[0].imshow(data, cmap='jet', vmin=vmin1, vmax=vmax1)
+    im0 = axes[0].imshow(data, cmap='jet', vmin=vmin1, vmax=vmax1, origin='lower')
     axes[0].set_title('Full Detector')
     plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
-    im1 = axes[1].imshow(np.log1p(data), cmap='jet', vmin=vmin2, vmax=vmax2)
+    im1 = axes[1].imshow(np.log1p(data), cmap='jet', vmin=vmin2, vmax=vmax2, origin='lower')
     axes[1].set_title('Log Scale')
     plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
     plt.tight_layout()
@@ -92,9 +92,8 @@ def _scan_extent(roi):
     ``imshow(extent=...)``.  Returns ``None`` for extent when the scan-position
     attributes are not present on *roi*.
 
-    The mapping depends on ``roi.slow_axis``:
-      - ``'scan_x'``: rows → X motor (slow), cols → Y motor (fast)
-      - anything else: rows → Y motor (slow), cols → X motor (fast)
+    The stacking functions always put scan_y on rows and scan_x on columns,
+    whichever axis is the slow one.
     """
     _x = ("scan_x_start_point", "scan_x_end_point")
     _y = ("scan_y_start_point", "scan_y_end_point")
@@ -104,14 +103,9 @@ def _scan_extent(roi):
     x0, x1 = roi.scan_x_start_point, roi.scan_x_end_point
     y0, y1 = roi.scan_y_start_point, roi.scan_y_end_point
 
-    if getattr(roi, "slow_axis", None) == "scan_x":
-        # rows = X (slow axis), cols = Y (fast axis)
-        extent = [y0, y1, x1, x0]      # [left, right, bottom, top]
-        xlabel, ylabel = "Scan Y (nm)", "Scan X (nm)"
-    else:
-        # rows = Y (slow axis), cols = X (fast axis)
-        extent = [x0, x1, y1, y0]
-        xlabel, ylabel = "Scan X (nm)", "Scan Y (nm)"
+    # rows = scan_y, cols = scan_x
+    extent = [x0, x1, y0, y1]      # [left, right, bottom, top], origin='lower'
+    xlabel, ylabel = "Scan X (nm)", "Scan Y (nm)"
 
     return extent, xlabel, ylabel
 
@@ -194,9 +188,9 @@ def plot_4d_dataset(roi: ROI,
     det_img = make_detector_image(roi.data_4d, np.array([lrow_slider.value, lcol_slider.value]))
 
     if extent is not None:
-        im0 = axes[0].imshow(coh_img, cmap='plasma', vmin=clim1_slider.value[0], vmax=clim1_slider.value[1], extent=extent)
+        im0 = axes[0].imshow(coh_img, cmap='plasma', vmin=clim1_slider.value[0], vmax=clim1_slider.value[1], extent=extent, origin='lower')
     else:
-        im0 = axes[0].imshow(coh_img, cmap='plasma', vmin=clim1_slider.value[0], vmax=clim1_slider.value[1])
+        im0 = axes[0].imshow(coh_img, cmap='plasma', vmin=clim1_slider.value[0], vmax=clim1_slider.value[1], origin='lower')
     axes[0].set_title(f"Coherent Image (lx={lrow_slider.value}, ly={lcol_slider.value})")
     axes[0].set_xlabel(coh_xlabel)
     axes[0].set_ylabel(coh_ylabel)
@@ -209,7 +203,7 @@ def plot_4d_dataset(roi: ROI,
     axes[0].add_patch(rect_coh)
     plt.colorbar(im0, ax=axes[0], label="Intensity")
 
-    im1 = axes[1].imshow(det_img, cmap='viridis', vmin=clim2_slider.value[0], vmax=clim2_slider.value[1])
+    im1 = axes[1].imshow(det_img, cmap='viridis', vmin=clim2_slider.value[0], vmax=clim2_slider.value[1], origin='lower')
     axes[1].set_title(f"Detector Image (px={pcol_slider.value}, py={prow_slider.value})")
     rect_det = Rectangle(
         (pcol_slider.value - rect_size_det / 2, prow_slider.value - rect_size_det / 2),
@@ -264,7 +258,7 @@ def plot_coherent_sequence(roi: ROI, scale_factor=0.4, vmin=None, vmax=None,
 
         fig, ax = plt.subplots(figsize=(6, 6))
         first = np.array(all_imgs[0][0])
-        im = ax.imshow(first, cmap='viridis', **({"extent": extent} if extent else {}))
+        im = ax.imshow(first, cmap='viridis', **({"extent": extent} if extent else {}), origin='lower')
         ax.set_title(f"Streak 0 — Image 0/{len(all_imgs[0]) - 1}")
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
@@ -298,7 +292,7 @@ def plot_coherent_sequence(roi: ROI, scale_factor=0.4, vmin=None, vmax=None,
         vmax_box   = widgets.FloatText(value=vmax if vmax is not None else 1.0,  description='Vmax:')
 
         fig, ax = plt.subplots(figsize=(6, 6))
-        im = ax.imshow(img_list[0], cmap='viridis', **({"extent": extent} if extent else {}))
+        im = ax.imshow(img_list[0], cmap='viridis', **({"extent": extent} if extent else {}), origin='lower')
         ax.set_title(f"Coherent Image  0/{num_images - 1}")
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
@@ -314,19 +308,10 @@ def plot_coherent_sequence(roi: ROI, scale_factor=0.4, vmin=None, vmax=None,
         display(widgets.interactive(update_image, img_idx=img_slider, vmin=vmin_box, vmax=vmax_box))
 
 
-def plot_averag_coh_imgs(roi: ROI, vmin: float | None = None, vmax: float | None = None,
-                         cmap: str = 'viridis', title: str | None = None,
+def _plot_coherent_image(roi: ROI, img, title: str, vmin: float | None = None,
+                         vmax: float | None = None, cmap: str = 'viridis',
                          use_positions: bool = False):
-    """Plot the average of `roi.coherent_imgs` with scan-axis labels.
-
-    Args:
-        use_positions: If True, label axes with motor positions in nm instead
-                       of generic 'Scan-X / Scan-Y' labels.
-    """
-    avg = roi.summed_coherent_images
-    if title is None:
-        title = f"Average Coherent Images: Scan {roi.scan_num}"
-
+    """Plot a 2D coherent (scan-space) image with scan-axis labels."""
     # Resolve extent and axis labels
     if use_positions:
         extent, xlabel, ylabel = _scan_extent(roi)
@@ -349,17 +334,48 @@ def plot_averag_coh_imgs(roi: ROI, vmin: float | None = None, vmax: float | None
         ikw["extent"] = extent
 
     _, ax = plt.subplots()
-    im = ax.imshow(avg, **ikw)
+    im = ax.imshow(img, **ikw, origin='lower')
     ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     plt.colorbar(im, ax=ax)
     plt.show()
 
+
+def plot_averag_coh_imgs(roi: ROI, vmin: float | None = None, vmax: float | None = None,
+                         cmap: str = 'viridis', title: str | None = None,
+                         use_positions: bool = False):
+    """Plot `roi.averaged_coherent_images` (data_4d averaged over the detector) with scan-axis labels.
+
+    Args:
+        use_positions: If True, label axes with motor positions in nm instead
+                       of generic 'Scan-X / Scan-Y' labels.
+    """
+    if title is None:
+        title = f"Averaged Coherent Image: Scan {roi.scan_num}"
+    _plot_coherent_image(roi, roi.averaged_coherent_images, title,
+                         vmin=vmin, vmax=vmax, cmap=cmap, use_positions=use_positions)
+
+
+def plot_summed_coh_imgs(roi: ROI, vmin: float | None = None, vmax: float | None = None,
+                         cmap: str = 'viridis', title: str | None = None,
+                         use_positions: bool = False):
+    """Plot `roi.summed_coherent_images` (data_4d summed over the detector) with scan-axis labels.
+
+    Args:
+        use_positions: If True, label axes with motor positions in nm instead
+                       of generic 'Scan-X / Scan-Y' labels.
+    """
+    if title is None:
+        title = f"Summed Coherent Image: Scan {roi.scan_num}"
+    _plot_coherent_image(roi, roi.summed_coherent_images, title,
+                         vmin=vmin, vmax=vmax, cmap=cmap, use_positions=use_positions)
+
+
 def plot_tilt_corrected_image(roi: ROI, vmin: float | None = None, vmax: float | None = None,
                          cmap: str = 'viridis', title: str | None = None,
                          use_positions: bool = False):
-    """Plot the average of `roi.coherent_imgs` with scan-axis labels.
+    """Plot `roi.tilt_corrected_image` with scan-axis labels.
 
     Args:
         use_positions: If True, label axes with motor positions in nm instead
@@ -367,40 +383,13 @@ def plot_tilt_corrected_image(roi: ROI, vmin: float | None = None, vmax: float |
     """
     if roi.tilt_corrected_image is None: 
         tilt_correct(roi = roi, iters = 3)
-    
-    avg = roi.tilt_corrected_image
-        
+
     if title is None:
-        title = f"Average Coherent Images: Scan {roi.scan_num}"
+        title = f"Tilt-corrected Coherent Image: Scan {roi.scan_num}"
+    _plot_coherent_image(roi, roi.tilt_corrected_image, title,
+                         vmin=vmin, vmax=vmax, cmap=cmap, use_positions=use_positions)
 
-    # Resolve extent and axis labels
-    if use_positions:
-        extent, xlabel, ylabel = _scan_extent(roi)
-    else:
-        extent = None
 
-    if extent is None:
-        if getattr(roi, 'slow_axis', None) == 'scan_x':
-            xlabel, ylabel = 'Scan-X: Slow Axis', 'Scan-Y: Fast Axis'
-        else:
-            xlabel, ylabel = 'Scan-X: Fast Axis', 'Scan-Y: Slow Axis'
-
-    # Build imshow kwargs to avoid passing None for typed parameters
-    ikw: dict[str, Any] = {"cmap": cmap}
-    if vmin is not None:
-        ikw["vmin"] = vmin
-    if vmax is not None:
-        ikw["vmax"] = vmax
-    if extent is not None:
-        ikw["extent"] = extent
-
-    _, ax = plt.subplots()
-    im = ax.imshow(avg, **ikw)
-    ax.set_title(title)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    plt.colorbar(im, ax=ax)
-    plt.show()
 def plot_detected_objects(roi: ROI):
     """Interactive slider viewer for `roi.detected_objects`."""
     img_list   = roi.detected_objects
@@ -408,7 +397,7 @@ def plot_detected_objects(roi: ROI):
     img_slider = widgets.IntSlider(min=0, max=num_images - 1, value=0, description="Image")
 
     fig, ax = plt.subplots(figsize=(6, 6))
-    im = ax.imshow(img_list[0], cmap='viridis')
+    im = ax.imshow(img_list[0], cmap='viridis', origin='lower')
     ax.set_title(f"Detected Object  0/{num_images - 1}")
     plt.colorbar(im, ax=ax, label="Intensity")
     plt.tight_layout()
@@ -445,11 +434,17 @@ def plot_intensity_histograms(roi: ROI, bins=256):
 def plot_average_roi(roi: ROI, vmin=None, vmax=None, title=None):
     """Plot the average of all detector frames in the ROI."""
     plot_roi_from_numpy(
-        roi.averaged_det_images, [0, -1, 0, -1],
+        roi.averaged_det_images, None,
         title or "Averaged Detector Frames",
         vmin=vmin, vmax=vmax,
     )
-
+def plot_sum_roi(roi: ROI, vmin=None, vmax=None, title=None):
+    """Plot the sum of all detector frames in the ROI."""
+    plot_roi_from_numpy(
+        roi.summed_det_images, None,
+        title or "Summed Detector Frames",
+        vmin=vmin, vmax=vmax,
+    )
 
 def plot_calculated_kins(roi: ROI, pupil_roi: ROI,
                          vmin=None, vmax=None,

@@ -166,12 +166,13 @@ class ROI:
     detector_mask: np.ndarray = field(default=None, repr=False)
 
     # acquired later
-    data_4d: np.ndarray = field(default=None, repr=False) # 4D Data set (x, y, fx, fy)
+    data_4d: np.ndarray = field(default=None, repr=False) # 4D Data set (scan_y, scan_x, det_row, det_col)
     centre_pixel: np.ndarray = field(default=(0,0), repr=False)
     
     # to be set automatically
     _averaged_det_images: np.ndarray = field(default=None, repr=False)  # Average of all detector frames 
     _averaged_coherent_images: np.ndarray = field(default=None, repr=False)
+    _summed_det_images: np.ndarray = field(default=None, repr=False)
     _summed_coherent_images: np.ndarray = field(default=None, repr=False)
     _delta_qz : float = field(default = 0.0, repr = True)
     _delta_q : float = field(default = 0.0, repr = True)
@@ -215,6 +216,24 @@ class ROI:
         for f in vars(self.scan):
             setattr(self, f, getattr(self.scan, f))
 
+    _AGGREGATE_CACHES = ("_averaged_det_images", "_summed_det_images",
+                         "_averaged_coherent_images", "_summed_coherent_images")
+
+    def __setattr__(self, name, value):
+        super().__setattr__(name, value)
+        # the averaged/summed images are cached from data_4d, so drop them when it changes
+        if name == "data_4d":
+            self.invalidate_aggregates()
+
+    def invalidate_aggregates(self):
+        """Clear the cached averaged/summed images so they are recomputed from data_4d.
+
+        Reassigning ``data_4d`` does this automatically; call it after editing
+        ``data_4d`` in place.
+        """
+        for attr in self._AGGREGATE_CACHES:
+            object.__setattr__(self, attr, None)
+
     # _______________ Properties ________________
     @property
     def averaged_det_images(self):
@@ -230,6 +249,21 @@ class ROI:
     @averaged_det_images.setter
     def averaged_det_images(self, value):
         self._averaged_det_images = value
+
+    @property
+    def summed_det_images(self):
+        
+        if self._summed_det_images is None:
+            self._summed_det_images = np.sum(self.data_4d, axis=(0,1))
+            
+        return self._summed_det_images
+
+    def update_summed_det_images(self):
+        self._summed_det_images = np.sum(self.data_4d, axis=(0,1))
+
+    @summed_det_images.setter
+    def summed_det_images(self, value):
+        self._summed_det_images = value
     
     @property
     def averaged_coherent_images(self):
@@ -244,7 +278,7 @@ class ROI:
         self._averaged_coherent_images = value
         
     def update_averaged_coherent_images(self):
-        self._averaged_coherent_images = np.sum(self.data_4d, axis=(2,3))
+        self._averaged_coherent_images = np.mean(self.data_4d, axis=(2,3))
     
     @property
     def summed_coherent_images(self):
@@ -329,11 +363,6 @@ class ROI:
         new.data_4d = self.data_4d + other.data_4d
         new.exposure_time = self.exposure_time + other.exposure_time
 
-        # invalidate cached aggregates — they must be recomputed from new data_4d
-        new._ROI__averaged_det_images = None
-        new._ROI__averaged_coherent_images = None
-        new._ROI__summed_coherent_images = None
-
         new.checkpoint_stack = []
         new.log_params = []
 
@@ -371,10 +400,6 @@ class ROI:
         peak_intensity = np.sum(other.data_4d, axis=(-2, -1))
         avg_intensity = np.mean(peak_intensity)
         self.data_4d = self.data_4d / peak_intensity[..., np.newaxis, np.newaxis] * avg_intensity
-
-        self._ROI__averaged_det_images = None
-        self._ROI__averaged_coherent_images = None
-        self._ROI__summed_coherent_images = None
 
         return self
 
@@ -538,9 +563,6 @@ class ROI:
 
     # _____________ Checkpointing _____________
     
-    # Name-mangled private cache attributes not in __dataclass_fields__
-    _PRIVATE_CACHE_ATTRS = ("_ROI__averaged_det_images", "_ROI__averaged_coherent_images")
-
     def checkpoint_state(self):
         """Save a deep copy of the current state for potential rollback."""
         state = copy.deepcopy({
@@ -548,9 +570,6 @@ class ROI:
             for key in self.__dataclass_fields__.keys()
             if key not in ("checkpoint_stack", "log_params")  # don't save logs or stack itself
         })
-        # Also save the private cached arrays (name-mangled, not in __dataclass_fields__)
-        for attr in self._PRIVATE_CACHE_ATTRS:
-            state[attr] = copy.deepcopy(getattr(self, attr, None))
         self.checkpoint_stack.append(state)
         print(f"[ROI] Checkpoint #{len(self.checkpoint_stack)} created.")
 
@@ -562,7 +581,7 @@ class ROI:
 
         last_state = self.checkpoint_stack.pop()
         for key, value in last_state.items():
-            setattr(self, key, value)  # works for both normal and mangled names
+            setattr(self, key, value)
     
     def auto_checkpoint(func):
         @wraps(func)

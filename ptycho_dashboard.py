@@ -236,7 +236,7 @@ def _make_image_fig(data: np.ndarray, title: str, log_scale: bool,
     for spine in ax.spines.values():
         spine.set_edgecolor(BORDER)
     disp = np.log1p(np.abs(data)) if log_scale else data
-    im = ax.imshow(disp, cmap=cmap, vmin=vmin, vmax=vmax, origin="upper")
+    im = ax.imshow(disp, cmap=cmap, vmin=vmin, vmax=vmax, origin="lower")
     ax.set_title(title, color=TXT, fontsize=11)
     cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     cb.set_label("log(1+|I|)" if log_scale else "Intensity", color=TXT_MUTED, fontsize=9)
@@ -1150,7 +1150,7 @@ def _execute_step(item: dict) -> None:
         fn(roi, params["region"], params["mode"])
         _add_roi_history(roi_name, f"{op} ✓")
     elif op == "Make k-outs":
-        roi_ops.make_kouts(roi, params["mask_val"])
+        roi_ops.make_kouts(roi, params["mask_val"], pupil_roi=pupil)
         _add_roi_history(roi_name, f"Make k-outs → n={len(roi.kout_coords)}")
     elif op == "Estimate 2θ":
         roi_ops.estimate_ttheta(roi, pupil)
@@ -1627,7 +1627,7 @@ def _update_4d_viewer(*_):
     if pp is not None:
         im0 = axes[0].imshow(coh, cmap=w_4dv_cmap_coh.value,
                              vmin=m - 0.05 * abs(m), vmax=m + 0.05 * abs(m),
-                             extent=pp["extent"])
+                             extent=pp["extent"], origin='lower')
         axes[0].set_xlabel(pp["xlabel"])
         axes[0].set_ylabel(pp["ylabel"])
         rect_x = pp["px_to_nm_col"](lcol) - pp["col_nm_size"](1)
@@ -1636,7 +1636,7 @@ def _update_4d_viewer(*_):
         rect_h = pp["row_nm_size"](2)
     else:
         im0 = axes[0].imshow(coh, cmap=w_4dv_cmap_coh.value,
-                             vmin=m - 0.05 * abs(m), vmax=m + 0.05 * abs(m))
+                             vmin=m - 0.05 * abs(m), vmax=m + 0.05 * abs(m), origin='lower')
         rect_x, rect_y, rect_w, rect_h = lcol - 1, lrow - 1, 2, 2
     axes[0].set_title(f"Coherent  px=({pcol}, {prow})")
     axes[0].add_patch(Rectangle((rect_x, rect_y), rect_w, rect_h,
@@ -1648,7 +1648,7 @@ def _update_4d_viewer(*_):
         axes[1].contour(roi.detector_mask, levels=[0.5], colors=[ACCENT], linewidths=0.8, alpha=0.7)
     m2 = np.nanmean(det_disp)
     im1 = axes[1].imshow(det_disp, cmap=w_4dv_cmap_det.value,
-                         vmin=m2 - 0.3 * abs(m2), vmax=m2 + 0.2 * abs(m2))
+                         vmin=m2 - 0.3 * abs(m2), vmax=m2 + 0.2 * abs(m2), origin='lower')
     axes[1].set_title(f"Detector  lx=({lcol}, {lrow})")
     axes[1].add_patch(Rectangle((pcol - 2, prow - 2), 4, 4, edgecolor='white', facecolor='none', lw=1.5))
     plt.colorbar(im1, ax=axes[1])
@@ -1831,15 +1831,15 @@ def _coh_pos_params(roi, hc: int, wc: int):
 
     # Convert nm → µm for display.
     # x-axis: scan_x_start (left) → scan_x_end (right)
-    # y-axis: scan_y_start (top)  → scan_y_end (bottom)
+    # y-axis: scan_y_start (bottom) → scan_y_end (top)
     img_x  = roi.scan_x_start_point / 1e3
     img_dw = (roi.scan_x_end_point - roi.scan_x_start_point) / 1e3
     img_y  = roi.scan_y_start_point / 1e3
     img_dh = (roi.scan_y_end_point - roi.scan_y_start_point) / 1e3
 
-    # matplotlib extent=[left, right, bottom, top], origin='upper':
-    # top = scan_y_start (row 0), bottom = scan_y_end (last row)
-    extent = [img_x, img_x + img_dw, img_y + img_dh, img_y]
+    # matplotlib extent=[left, right, bottom, top], origin='lower':
+    # bottom = scan_y_start (row 0), top = scan_y_end (last row)
+    extent = [img_x, img_x + img_dw, img_y, img_y + img_dh]
     xlabel, ylabel = "Scan X (µm)", "Scan Y (µm)"
 
     def px_to_nm_col(col):
@@ -2412,7 +2412,7 @@ def _make_scan_tab(scan_label: str) -> pn.Column:
         for sp in ax.spines.values():
             sp.set_edgecolor(BORDER)
         disp = np.log1p(img.astype(float))
-        im = ax.imshow(disp, cmap="viridis", origin="upper")
+        im = ax.imshow(disp, cmap="viridis", origin="lower")
         cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         cb.set_label("log(1+I)", color=TXT_MUTED, fontsize=8)
         plt.setp(cb.ax.yaxis.get_ticklabels(), color=TXT_MUTED)
@@ -2668,7 +2668,7 @@ def _make_scan_tab(scan_label: str) -> pn.Column:
 
         fig, ax = plt.subplots(figsize=(5, 4), facecolor=BG_DARK)
         ax.set_facecolor(BG_DARK)
-        ax.imshow(rgb, origin="upper", interpolation="nearest", aspect="equal")
+        ax.imshow(rgb, origin="lower", interpolation="nearest", aspect="equal")
         # Bounding box overlay
         from matplotlib.patches import Rectangle as _Rect
         ax.add_patch(_Rect(
