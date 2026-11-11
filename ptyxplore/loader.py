@@ -194,10 +194,11 @@ class ROI:
     kins: np.ndarray = field(default=None, repr=False)  # Kin vectors
     
     kins_avg: np.ndarray = field(default=None, repr=False)  # average Kins 
-    # For computing kins 
-    optimal_angles: list = field(default=None, repr=False)  # Euler angles that rotate Kout to Kin
     est_ttheta: float = field(default=None, repr=False)
-    g_init: np.ndarray = field(default=None, repr=False)  # Initial G vector for a Signal
+    # Global G of the reflection (compute_kins_global_G) and per-pixel Ewald q_z at K = 0
+    G: np.ndarray = field(default=None, repr=False)
+    qz0: np.ndarray = field(default=None, repr=False)
+    kins_info: dict = field(default=None, repr=False)
     
     log_params: list = field(default_factory=list, repr = False)
     
@@ -450,6 +451,10 @@ class ROI:
             _save_streakable(kvectors, "kouts",       self.kouts)
             _save_streakable(kvectors, "kin_coords",  self.kin_coords)
             _save_streakable(kvectors, "kout_coords", self.kout_coords)
+            if self.qz0 is not None:
+                _save_streakable(kvectors, "qz0", self.qz0)
+            if self.G is not None:
+                kvectors.attrs["G"] = self.G
                 
             print(f"Data saved at {file_path}")
 
@@ -519,6 +524,8 @@ class ROI:
             self.kouts      = _load_streakable(kvectors, "kouts")
             self.kin_coords = _load_streakable(kvectors, "kin_coords")
             self.kout_coords = _load_streakable(kvectors, "kout_coords")
+            self.qz0 = _load_streakable(kvectors, "qz0") if "qz0" in kvectors else None
+            self.G = np.asarray(kvectors.attrs["G"]) if "G" in kvectors.attrs else None
                 
         return self
     

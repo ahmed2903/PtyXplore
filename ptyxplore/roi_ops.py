@@ -13,10 +13,10 @@ from tqdm import tqdm
 
 from .data_io import *
 from .data_proc import *
-from .kvectors import (make_coordinates, compute_vectors, optimise_kin, optimise_kin_w_geometry,
-                       reverse_kins_to_pixels, rotation_matrix, calc_qvec, extract_parallel_line,
+from .kvectors import (make_coordinates, compute_vectors, reverse_kins_to_pixels,
+                       fit_global_G, shift_G, kins_from_G, qz_from_G, extract_parallel_line,
                        extract_streak_region, compute_k_bounds,
-                       projection_kin_refinement, iterate_kin_refinement, calculate_delta_qz, calculate_delta_q, calc_effective_pixel_size, extract_qz_streaks, estimate_ttheta)
+                       calculate_delta_qz, calculate_delta_q, calc_effective_pixel_size, extract_qz_streaks, estimate_ttheta)
 
 from .utils import time_it, log_roi_params
 from .geometry import *
@@ -410,308 +410,116 @@ def estimate_ttheta_from_pupil(roi:ROI, pupil_roi:ROI):
 
     
 @log_roi_params
-def compute_kins(roi: ROI, pupil_roi: ROI, est_ttheta, method="BFGS", gtol=1e-6):
+def compute_kins_global_G(roi: ROI, pupil_roi: ROI, ttheta_deg=None, use_intensity=True,
+                          g_u_from_footprint=False):
     """
-    Compute incident wave-vectors for a single- or multi-streak ROI.
+    Incident wave-vectors from ONE G shared by every pixel of the reflection
+    (see kvectors.fit_global_G). The detector geometry is not changed.
 
-    For multi-streak ROIs (roi.kouts is a list), each streak is optimised
-    independently with its own G vector.  est_ttheta may be a scalar
-    (shared across all streaks) or a list with one value per streak.
-
-    Updates
-    -------
-    Single-streak: roi.g_init, roi.kins, roi.optimal_angles, roi.kin_coords
-    Multi-streak : all of the above as parallel lists (one entry per streak)
-    """
-    multi = isinstance(roi.kouts, list)
-    kouts_list = roi.kouts if multi else [roi.kouts]
-
-    if np.isscalar(est_ttheta):
-        tthetas = [est_ttheta] * len(kouts_list)
-    else:
-        tthetas = list(est_ttheta)
-
-    g_inits, kins_list, angles_list = [], [], []
-    for kouts_s, ttheta_s in zip(kouts_list, tthetas):
-        g_init_s = calc_qvec(kouts_s, pupil_roi.kins_avg)
-        kins_s, angles_s = optimise_kin(g_init_s, ttheta_s, kouts_s,
-                                        roi.wavelength, method, gtol)
-        g_inits.append(g_init_s)
-        kins_list.append(kins_s)
-        angles_list.append(angles_s)
-
-    if multi:
-        roi.g_vectors = g_inits
-        roi.kins = kins_list
-        roi.optimal_angles = angles_list
-        roi.kin_coords = [
-            reverse_kins_to_pixels(kins_s, roi.det_psize, roi.det_distance, roi.centre_pixel)
-            for kins_s in kins_list
-        ]
-    else:
-        roi.g_vectors = g_inits[0]
-        roi.kins = kins_list[0]
-        roi.optimal_angles = angles_list[0]
-        roi.kin_coords = reverse_kins_to_pixels(
-            roi.kins, roi.det_psize, roi.det_distance, roi.centre_pixel
-        )
-
-@log_roi_params
-def compute_kins_w_geometry(roi: ROI, pupil_roi: ROI, method="BFGS", gtol=1e-6):
-    """
-    Compute incident wave-vectors jointly with detector-geometry refinement,
-    for a single- or multi-streak ROI.
-
-    For multi-streak ROIs (roi.kouts is a list of (N_s, 3) arrays and
-    roi.kout_coords is a matching list), each streak is optimised independently
-    with its own G vector.  The detector distance — a global calibration
-    parameter — is taken as the median across all per-streak estimates and
-    written back to both roi and pupil_roi.
-
-    Updates
-    -------
-    Single-streak: roi.g_init, roi.kins, roi.kouts, roi.optimal_angles,
-                   roi.det_distance, roi.kin_coords, pupil_roi.kins,
-                   pupil_roi.det_distance
-    Multi-streak : all roi attributes as parallel lists; shared det_distance
-                   and pupil_roi.kins recomputed at consensus distance
-    """
-    multi = isinstance(roi.kouts, list)
-    kouts_list = roi.kouts if multi else [roi.kouts]
-    kout_coords_list = roi.kout_coords if multi else [roi.kout_coords]
-
-    g_inits, kins_list, kouts_refined, angles_list, distances = [], [], [], [], []
-
-    for kouts_s, kout_coords_s in zip(kouts_list, kout_coords_list):
-        g_init_s = calc_qvec(kouts_s, pupil_roi.kins_avg)
-        
-        kins_s, kouts_s_new, kins_pupil_s, params_s = optimise_kin_w_geometry(
-            G_init =g_init_s, det_distance_init = roi.det_distance,
-            kin_pixels = pupil_roi.kin_coords, kout_pixels = kout_coords_s,
-            wavelength = roi.wavelength, pixel_size = roi.det_psize, central_pixel = roi.centre_pixel,
-            method=method, gtol= gtol,
-        )
-        g_inits.append(g_init_s)
-        kins_list.append(kins_s)
-        kouts_refined.append(kouts_s_new)
-        angles_list.append(params_s[1:])
-        distances.append(float(params_s[0]))
-
-    det_distance = float(np.median(distances))
-    roi.det_distance = det_distance
-    pupil_roi.det_distance = det_distance
-    pupil_roi.kins = compute_vectors(
-        pupil_roi.kin_coords, det_distance, roi.det_psize, roi.centre_pixel, roi.wavelength
-    )
-
-    if multi:
-        roi.g_init = g_inits
-        roi.kins = kins_list
-        roi.kouts = kouts_refined
-        roi.optimal_angles = angles_list
-        roi.kin_coords = [
-            reverse_kins_to_pixels(kins_s, roi.det_psize, det_distance, roi.centre_pixel)
-            for kins_s in kins_list
-        ]
-    else:
-        roi.g_init = g_inits[0]
-        roi.kins = kins_list[0]
-        roi.kouts = kouts_refined[0]
-        roi.optimal_angles = angles_list[0]
-        roi.kin_coords = reverse_kins_to_pixels(
-            roi.kins, roi.det_psize, det_distance, roi.centre_pixel
-        )
-    
-    
-@log_roi_params
-@time_it
-def compute_kins_projection(roi: ROI, pupil_roi: ROI,
-                            n_iterations=5, n_inner=3, clamp_to_pupil=False,
-                            enforce_coplanar=False, ttheta=None):
-    """
-    Refine kins for one or multiple streaks using Ewald-circle projection.
-
-    Per inner iteration:
-      1. Project kins onto the Ewald circle for current G  (enforces |kin| = k)
-      2. Update G = mean(kouts - kins_proj)
-      3. Optionally rescale G to enforce |G| = 2k sin(ttheta/2)  (C3)
-      4. Optionally clamp G_xy to the pupil-support feasible interval
-
-    After all per-streak steps, optionally apply a coplanar projection across
-    all streaks (see enforce_coplanar).
-
-    Handles both single-streak ROIs (roi.kouts is an (N,3) array) and
-    multi-streak ROIs produced by make_parallel_streaks (roi.kouts is a list
-    of (N_s,3) arrays).
-
-    If roi.g_init or roi.g_list exists (set by a prior compute_kins /
-    compute_kins_w_geometry call), it is used as the starting G for each streak.
-
-    Parameters
-    ----------
-    roi              : ROI whose kouts will be used as the streak k-vectors.
-    pupil_roi        : ROI whose kouts define the pupil aperture bounds.
-    n_iterations     : outer alternating-projection iterations.
-    n_inner          : inner Ewald-projection steps per streak per outer iteration.
-    clamp_to_pupil   : if True, additionally clamp G_xy so all implied kins lie
-                       inside the pupil box (only reliable when width_ratio ≈ 1).
-    enforce_coplanar : if True, project all G_s onto their best-fit plane after
-                       each outer iteration, enforcing that all scattering vectors
-                       lie in the same crystallographic plane.  Requires at least
-                       3 streaks to be non-trivial; silently ignored otherwise.
-    ttheta           : two-theta angle(s) in radians.  A scalar is shared across
-                       all streaks; a list provides one value per streak.  When
-                       given, G is radially rescaled after each G update so that
-                       |G| = 2k sin(ttheta/2) is enforced (C3).  If None (default)
-                       the magnitude of G floats freely.  Use roi.est_ttheta
-                       (converted to radians) as a convenient source.
-
-    Updates
-    -------
-    Single-streak: roi.kins (N,3), roi.g_init (3,), roi.kin_coords (N,2)
-    Multi-streak : roi.kins (list), roi.g_list (list), roi.kin_coords (list)
-    Always       : roi.width_ratios, roi.projection_history
-    Multi-streak + coplanar: roi.scattering_plane_normal (3,)
-    """
-    multi = isinstance(roi.kouts, list)
-    kouts_list = roi.kouts if multi else [roi.kouts]
-
-    (kx_min, kx_max), (ky_min, ky_max) = compute_k_bounds(pupil_roi.kouts)
-    pupil_kbounds = (kx_min, kx_max, ky_min, ky_max)
-
-    # Forward G initialisation from a prior compute_kins / compute_kins_w_geometry call.
-    g_init_attr = getattr(roi, 'g_vectors', None)
-    
-    if g_init_attr is None:
-        g_init_attr = getattr(roi, 'g_vectors', None)
-    if g_init_attr is not None:
-        G_init_list = g_init_attr if isinstance(g_init_attr, list) else [g_init_attr]
-        if len(G_init_list) != len(kouts_list):
-            G_init_list = None  # shape mismatch — fall back to bootstrap
-    else:
-        G_init_list = None
-
-    G_list, kins_list, width_ratios, history = projection_kin_refinement(
-        kouts_list, pupil_kbounds, roi.wavelength,
-        n_iterations, n_inner, clamp_to_pupil, G_init_list, enforce_coplanar,
-        ttheta_list=ttheta,
-    )
-
-    # Store the final scattering plane normal if coplanar was applied
-    last = history[-1] if history else {}
-    if last.get('plane_normal') is not None:
-        roi.scattering_plane_normal = last['plane_normal']
-
-    roi.width_ratios = width_ratios
-    roi.projection_history = history
-
-    if multi:
-        roi.kins = kins_list
-        roi.g_vectors = G_list
-        roi.kin_coords = [
-            reverse_kins_to_pixels(kins, roi.det_psize, roi.det_distance, roi.centre_pixel)
-            for kins in kins_list
-        ]
-    else:
-        roi.kins = kins_list[0]
-        roi.g_vectors = G_list[0]
-        roi.kin_coords = reverse_kins_to_pixels(
-            roi.kins, roi.det_psize, roi.det_distance, roi.centre_pixel
-        )
-
-
-@log_roi_params
-def compute_kins_iterate(roi: ROI, pupil_roi: ROI, method='BFGS', gtol=1e-6,
-                         n_iterations=5, reestimate_ttheta=False):
-    """
-    Refine kins for a single-streak ROI by alternating between geometry
-    refinement and 2theta/angle refinement.
-
-    Each cycle:
-      1. optimise_kin_w_geometry — jointly refines the detector distance and G
-         orientation using elastic-scattering and pupil-support constraints.
-      2. optimise_kin — refines G orientation using the 2theta dot-product
-         objective on the updated k-vectors.
-
-    Parameters
-    ----------
-    roi               : single-streak Bragg ROI.
-    pupil_roi         : ROI whose kin_coords define the pupil pixel positions.
-    method            : scipy.optimize.minimize method string.
-    gtol              : gradient tolerance for both optimisers.
-    n_iterations      : number of geometry <-> angle cycles.
-    reestimate_ttheta : if True, re-derive 2theta from refined k-vectors after
-                        each geometry step instead of holding it fixed.
-
-    Updates
-    -------
-    roi.kins, roi.kouts, roi.g_init, roi.det_distance,
-    roi.kin_coords, roi.refinement_history
-    pupil_roi.kins, pupil_roi.det_distance
-    """
-    if isinstance(roi.kouts, list):
-        raise ValueError(
-            "compute_kins_iterate works on a single-streak ROI. "
-            "Run it per-streak or use compute_kins_projection for multi-streak ROIs."
-        )
-
-    roi.g_init = calc_qvec(roi.kouts, pupil_roi.kins_avg)
-    ttheta = np.deg2rad(roi.est_ttheta)
-
-    kin_opt, kouts, kins_pupil, G_opt, det_distance, history = iterate_kin_refinement(
-        roi.g_init,
-        roi.det_distance,
-        pupil_roi.kin_coords,
-        roi.kout_coords,
-        ttheta,
-        roi.wavelength,
-        roi.det_psize,
-        roi.centre_pixel,
-        n_iterations=n_iterations,
-        method=method,
-        gtol=gtol,
-        reestimate_ttheta=reestimate_ttheta,
-    )
-
-    roi.kins = kin_opt
-    roi.kouts = kouts
-    roi.g_init = G_opt
-    roi.det_distance = det_distance
-    roi.refinement_history = history
-    roi.kin_coords = reverse_kins_to_pixels(
-        roi.kins, roi.det_psize, roi.det_distance, roi.centre_pixel
-    )
-
-    pupil_roi.kins = kins_pupil
-    pupil_roi.det_distance = det_distance
-
-
-@log_roi_params
-def refine_kins(roi:ROI, shifts):
-    """
-    Refine the estimated incident wavevectors (kins) by adjusting the optimal angles.
+    Each pixel gets k_in,perp = k_out,perp - G_perp with k_in,z on the elastic sphere, so
+    k_out,z - k_in,z - G_z is that pixel's Ewald q_z (used by make_qz_streaks and by the
+    3D reconstruction).
 
     Args:
-        roi_name (str): The region of interest name.
-        shifts (tuple): A tuple of (alpha_shift, beta_shift, gamma_shift) to refine angles.
-    """
-    alpha,beta,gamma = (roi.optimal_angles[0] + shifts[0],
-                        roi.optimal_angles[1] + shifts[1],
-                        roi.optimal_angles[2] + shifts[2] )
-    
-    R = rotation_matrix(alpha, beta, gamma)
-    try:
-        g_update =  R @ roi.g_init
-    except:
-        g_update =  R @ roi.g_init[0]
-    kin_opt = (roi.kouts-g_update)
-    kin_opt /= np.linalg.norm(kin_opt, axis = 1)[:,np.newaxis]
-    kin_opt *= 2*np.pi/roi.wavelength
-    roi.kins = kin_opt
-    roi.kin_coords = reverse_kins_to_pixels(roi.kins,   roi.det_psize, 
-                                                        roi.det_distance, 
-                                                        roi.centre_pixel)
+        roi                : Bragg ROI with kouts (flat array or list of streaks).
+        pupil_roi          : bright-field ROI with kins (from make_kouts).
+        ttheta_deg         : 2θ of the reflection in degrees (from the lattice) for |G|.
+                             None -> estimated from the intensity-weighted dark-field centroid.
+        use_intensity      : weight pixels by the averaged detector image (relrod centre
+                             -> q_z = 0). False -> uniform weights.
+        g_u_from_footprint : take G along 2θ from the footprint as well (thin crystals whose
+                             streaks span the whole pupil width).
 
+    Updates:
+        roi.G (3,), roi.kins, roi.kin_coords, roi.qz0 (per-pixel q_z, same structure as kouts),
+        roi.kins_info (diagnostics dict)
+    """
+    multi = isinstance(roi.kouts, list)
+    kouts_list = roi.kouts if multi else [roi.kouts]
+    coords_list = roi.kout_coords if multi else [roi.kout_coords]
+    kouts = np.concatenate(kouts_list)
+    coords = np.concatenate(coords_list)
+
+    weights = _pixel_weights(roi, coords) if use_intensity else None
+
+    ttheta = None if ttheta_deg is None else np.deg2rad(ttheta_deg)
+    G, info = fit_global_G(kouts, pupil_roi.kins, roi.wavelength, weights=weights,
+                           ttheta=ttheta, g_u_from_footprint=g_u_from_footprint)
+
+    _set_kins_from_G(roi, G, info)
+
+    print(f"compute_kins_global_G: G = {G}, 2θ = {np.rad2deg(info['ttheta']):.4f}°, "
+          f"q_z(0) range = [{info['qz0'].min():.4e}, {info['qz0'].max():.4e}], "
+          f"kins outside pupil box: {100 * info['frac_outside_pupil']:.1f}%")
+
+
+def _pixel_weights(roi: ROI, coords):
+    """Averaged detector intensity at each (row, col) pixel; None if unavailable."""
+    try:
+        avg = roi.averaged_det_images
+        return avg[coords[:, 0] - roi.coords[0], coords[:, 1] - roi.coords[2]]
+    except (IndexError, TypeError, AttributeError) as err:
+        print(f"no intensity weights ({err}); using uniform weights")
+        return None
+
+
+def _set_kins_from_G(roi: ROI, G, info):
+    """Write roi.G, kins, kin_coords and qz0 (flat or per-streak lists) for one global G."""
+    multi = isinstance(roi.kouts, list)
+    kouts_list = roi.kouts if multi else [roi.kouts]
+
+    k = 2 * np.pi / roi.wavelength
+    kins_list = [kins_from_G(ko, G, k) for ko in kouts_list]
+    qz_list = [qz_from_G(ko, G, k) for ko in kouts_list]
+    kin_coords_list = [reverse_kins_to_pixels(ki, roi.det_psize, roi.det_distance, roi.centre_pixel)
+                       for ki in kins_list]
+
+    roi.G = G
+    roi.kins_info = info
+    roi.kins = kins_list if multi else kins_list[0]
+    roi.qz0 = qz_list if multi else qz_list[0]
+    roi.kin_coords = kin_coords_list if multi else kin_coords_list[0]
+
+
+@log_roi_params
+def shift_kins(roi: ROI, d_row=0.0, d_col=0.0, keep='qz0', use_intensity=True):
+    """
+    Manual refinement of the global G (after compute_kins_global_G): move the streak in the
+    pupil by (d_row, d_col) detector pixels (fractions allowed). Rows are k_x, cols are k_y,
+    as in compute_vectors / reverse_kins_to_pixels.
+
+    The kins stay elastic (|k_in| = k) and stay rigidly paired with their k_outs through one
+    G, so the streak moves without distortion. The kins depend only on the shift; `keep`
+    only sets G_z and so q_z (see kvectors.shift_G):
+      'qz0'   : (default) re-zero the weighted mean q_z(0); |G|, i.e. 2θ, changes slightly.
+      'G_mag' : rotate G (|G| fixed, trusts 2θ); the relrod centre moves off q_z = 0.
+
+    Updates: roi.G, roi.kins, roi.kin_coords, roi.qz0, roi.kins_info (adds 'shift_px').
+    """
+    if getattr(roi, "G", None) is None:
+        raise ValueError("shift_kins: run compute_kins_global_G first")
+
+    multi = isinstance(roi.kouts, list)
+    kouts = np.concatenate(roi.kouts) if multi else roi.kouts
+    coords = np.concatenate(roi.kout_coords) if multi else roi.kout_coords
+
+    k = 2 * np.pi / roi.wavelength
+    dk = k * roi.det_psize / roi.det_distance          # k per detector pixel near the centre
+    weights = _pixel_weights(roi, coords) if (use_intensity and keep == 'qz0') else None
+
+    G_old = roi.G
+    G = shift_G(G_old, dk * np.array([d_row, d_col]), k, kouts=kouts, weights=weights, keep=keep)
+
+    info = dict(roi.kins_info or {})
+    info['qz0'] = qz_from_G(kouts, G, k)
+    info['ttheta'] = 2 * np.arcsin(np.linalg.norm(G) / (2 * k))
+    info['shift_px'] = np.add(info.get('shift_px', (0.0, 0.0)), (d_row, d_col))
+    _set_kins_from_G(roi, G, info)
+
+    rot = np.rad2deg(np.arccos(np.clip(G @ G_old / (np.linalg.norm(G) * np.linalg.norm(G_old)), -1, 1)))
+    print(f"shift_kins: G = {G}, |G| change = {np.linalg.norm(G) - np.linalg.norm(G_old):.3e}, "
+          f"rotation = {rot:.4f}°, mean q_z(0) = {info['qz0'].mean():.4e}, "
+          f"total shift = {info['shift_px']} px")
 
 
 def select_single_pixel_streak(roi:ROI, width=1, offset=0, inplace = False):
@@ -736,7 +544,8 @@ def select_single_pixel_streak(roi:ROI, width=1, offset=0, inplace = False):
         roi.kin_coords = roi.kin_coords[mask]
         roi.kouts = roi.kouts[mask]
         roi.kout_coords = roi.kout_coords[mask]
-        roi.g_vectors = roi.g_vectors[mask]
+        if getattr(roi, "qz0", None) is not None:
+            roi.qz0 = roi.qz0[mask]
         
         try:
             roi.coherent_imgs = roi.coherent_imgs[mask]
@@ -781,7 +590,7 @@ def make_qz_streaks(roi, dqz=None, extent=None, min_pixels=5):
 
     # edges covers every bin, including ones dropped by min_pixels, so keep the
     # q_z of each kept streak separately (same q_z definition as extract_qz_streaks)
-    qz = roi.kouts[:, 2] - roi.kins[:, 2]
+    qz = roi.qz0 if getattr(roi, "qz0", None) is not None else roi.kouts[:, 2] - roi.kins[:, 2]
     roi.qz_centres = np.array([qz[m].mean() for m in masks])
 
     roi.coherent_imgs = [roi.coherent_imgs[m] for m in masks]
@@ -789,9 +598,8 @@ def make_qz_streaks(roi, dqz=None, extent=None, min_pixels=5):
     roi.kouts         = [roi.kouts[m] for m in masks]
     roi.kin_coords    = [roi.kin_coords[m] for m in masks]
     roi.kout_coords   = [roi.kout_coords[m] for m in masks]
-
-    # if hasattr(roi, "g_vectors"):
-    #     roi.g_vectors = [roi.g_vectors[m] for m in masks]
+    if getattr(roi, "qz0", None) is not None:
+        roi.qz0 = [roi.qz0[m] for m in masks]
 
     roi.qz_edges = edges
     roi.qz_masks = masks
@@ -1116,16 +924,16 @@ def flip_images(roi:ROI, flip_mode):
     Returns:
         np.ndarray: The transformed batch of images.
     """
-    if flip_mode == "xy":
-        return roi.coherent_imgs
-    elif flip_mode == "x_neg_y":
-        return [np.flip(img, axis=0) for img in roi.coherent_imgs]
-    elif flip_mode == "neg_x_y":
-        return [np.flip(img, axis=1) for img in roi.coherent_imgs]
-    elif flip_mode == "neg_x_neg_y":
-        return [np.flip(img, axis=(0, 1)) for img in roi.coherent_imgs]
-    else:
+    # Image axes are the last two (rows = scan_y, cols = scan_x), both for a flat
+    # (N, H, W) stack and for each (n_s, H, W) array of a multi-streak list.
+    axes = {"xy": None, "x_neg_y": (-2,), "neg_x_y": (-1,), "neg_x_neg_y": (-2, -1)}
+    if flip_mode not in axes:
         raise ValueError(f"Invalid flip_mode: {flip_mode}")
+    ax = axes[flip_mode]
+    flip = (lambda a: np.asarray(a)) if ax is None else (lambda a: np.flip(np.asarray(a), axis=ax))
+    if isinstance(roi.coherent_imgs, list):
+        return [flip(imgs) for imgs in roi.coherent_imgs]
+    return flip(roi.coherent_imgs)
 
 def tilt_correct(roi:ROI, iters = 3):
     

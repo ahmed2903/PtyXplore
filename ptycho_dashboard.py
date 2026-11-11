@@ -823,8 +823,6 @@ _ALL_OPS = {
     "Make k-outs":              {"target": "roi"},
     "Estimate 2θ":              {"target": "roi", "needs_pupil": True},
     "Compute kins":             {"target": "roi", "needs_pupil": True},
-    "Compute kins w geometry":  {"target": "roi", "needs_pupil": True},
-    "Refine kins":              {"target": "roi"},
     "Make coherent images":     {"target": "roi"},
     "Filter coherent images":   {"target": "roi"},
     "Remove background":        {"target": "roi"},
@@ -873,12 +871,8 @@ pw_region_re   = pn.widgets.IntInput(  name="region row end",     value=10,  wid
 pw_region_cs   = pn.widgets.IntInput(  name="region col start",   value=0,   width=130)
 pw_region_ce   = pn.widgets.IntInput(  name="region col end",     value=10,  width=130)
 pw_region_mode = pn.widgets.Select(    name="mode", options=["zeros","median","ones"], value="median", width=120)
-pw_est_ttheta  = pn.widgets.FloatInput(name="est_ttheta (deg)",   value=1.0, step=0.1, width=160)
-pw_method      = pn.widgets.Select(    name="method", options=["BFGS","L-BFGS-B","Nelder-Mead"], value="BFGS", width=150)
-pw_gtol        = pn.widgets.FloatInput(name="gtol",               value=1e-6, width=130)
-pw_alpha       = pn.widgets.FloatInput(name="alpha shift",        value=0.0, step=1e-4, width=130)
-pw_beta        = pn.widgets.FloatInput(name="beta shift",         value=0.0, step=1e-4, width=130)
-pw_gamma       = pn.widgets.FloatInput(name="gamma shift",        value=0.0, step=1e-4, width=130)
+pw_est_ttheta  = pn.widgets.FloatInput(name="2θ (deg, 0 = auto)", value=0.0, step=0.1, width=160)
+pw_use_int     = pn.widgets.Checkbox(  name="intensity weights",  value=True)
 pw_var_thresh  = pn.widgets.FloatInput(name="variance threshold", value=0.1, step=0.01, width=180)
 pw_sigma       = pn.widgets.FloatInput(name="sigma",              value=2.0, step=0.5,  width=120)
 pw_med_thresh  = pn.widgets.FloatInput(name="threshold",          value=3.0, step=0.5,  width=120)
@@ -931,11 +925,7 @@ def _refresh_pipe_params(event=None):
     elif op == "Make k-outs":
         pipe_params_col.append(pw_mask_val)
     elif op == "Compute kins":
-        pipe_params_col.append(pn.Row(pw_est_ttheta, pw_method, pw_gtol))
-    elif op == "Compute kins w geometry":
-        pipe_params_col.append(pn.Row(pw_method, pw_gtol))
-    elif op == "Refine kins":
-        pipe_params_col.append(pn.Row(pw_alpha, pw_beta, pw_gamma))
+        pipe_params_col.append(pn.Row(pw_est_ttheta, pw_use_int))
     elif op == "Filter coherent images":
         pipe_params_col.append(pw_var_thresh)
     elif op == "Remove background":
@@ -984,11 +974,7 @@ def _snapshot_params(op: str) -> dict:
     elif op == "Make k-outs":
         p["mask_val"] = pw_mask_val.value
     elif op == "Compute kins":
-        p.update(est_ttheta=pw_est_ttheta.value, method=pw_method.value, gtol=pw_gtol.value)
-    elif op == "Compute kins w geometry":
-        p.update(method=pw_method.value, gtol=pw_gtol.value)
-    elif op == "Refine kins":
-        p.update(alpha=pw_alpha.value, beta=pw_beta.value, gamma=pw_gamma.value)
+        p.update(est_ttheta=pw_est_ttheta.value, use_intensity=pw_use_int.value)
     elif op == "Filter coherent images":
         p["var_thresh"] = pw_var_thresh.value
     elif op == "Remove background":
@@ -1153,17 +1139,13 @@ def _execute_step(item: dict) -> None:
         roi_ops.make_kouts(roi, params["mask_val"], pupil_roi=pupil)
         _add_roi_history(roi_name, f"Make k-outs → n={len(roi.kout_coords)}")
     elif op == "Estimate 2θ":
-        roi_ops.estimate_ttheta(roi, pupil)
+        roi_ops.estimate_ttheta_from_pupil(roi, pupil)
         _add_roi_history(roi_name, f"Estimate 2θ → {roi.est_ttheta:.3f}°")
     elif op == "Compute kins":
-        roi_ops.compute_kins(roi, pupil, params["est_ttheta"], params["method"], params["gtol"])
-        _add_roi_history(roi_name, f"Compute kins → n={len(roi.kins)}")
-    elif op == "Compute kins w geometry":
-        roi_ops.compute_kins_w_geometry(roi, pupil, params["method"], params["gtol"])
-        _add_roi_history(roi_name, "Compute kins w geometry ✓")
-    elif op == "Refine kins":
-        roi_ops.refine_kins(roi, (params["alpha"], params["beta"], params["gamma"]))
-        _add_roi_history(roi_name, "Refine kins ✓")
+        roi_ops.compute_kins_global_G(roi, pupil, ttheta_deg=params["est_ttheta"] or None,
+                                      use_intensity=params.get("use_intensity", True))
+        _add_roi_history(roi_name, f"Compute kins (global G) → G={np.round(roi.G, 4)}, "
+                                   f"{100 * roi.kins_info['frac_outside_pupil']:.1f}% outside pupil")
     elif op == "Make coherent images":
         roi_ops.make_coherent_images(roi)
         _add_roi_history(roi_name, f"Make coherent images → n={len(roi.coherent_imgs)}")
@@ -3191,12 +3173,8 @@ def _make_roi_tab(roi_name: str) -> pn.Tabs:
         "region_cs":   pn.widgets.IntInput(  name="region col start",      value=0,   width=130),
         "region_ce":   pn.widgets.IntInput(  name="region col end",        value=10,  width=130),
         "region_mode": pn.widgets.Select(    name="mode", options=["zeros","median","ones"], value="median", width=120),
-        "est_ttheta":  pn.widgets.FloatInput(name="est_ttheta (deg)",      value=1.0, step=0.1, width=160),
-        "method":      pn.widgets.Select(    name="method", options=["BFGS","L-BFGS-B","Nelder-Mead"], value="BFGS", width=150),
-        "gtol":        pn.widgets.FloatInput(name="gtol",                  value=1e-6, width=130),
-        "alpha":       pn.widgets.FloatInput(name="alpha shift",           value=0.0, step=1e-4, width=130),
-        "beta":        pn.widgets.FloatInput(name="beta shift",            value=0.0, step=1e-4, width=130),
-        "gamma":       pn.widgets.FloatInput(name="gamma shift",           value=0.0, step=1e-4, width=130),
+        "est_ttheta":  pn.widgets.FloatInput(name="2θ (deg, 0 = auto)",    value=0.0, step=0.1, width=160),
+        "use_int":     pn.widgets.Checkbox(  name="intensity weights",     value=True),
         "var_thresh":  pn.widgets.FloatInput(name="variance threshold",    value=0.1, step=0.01, width=180),
         "sigma":       pn.widgets.FloatInput(name="sigma",                 value=2.0, step=0.5,  width=120),
         "med_thresh":  pn.widgets.FloatInput(name="threshold",             value=3.0, step=0.5,  width=120),
@@ -3246,11 +3224,7 @@ def _make_roi_tab(roi_name: str) -> pn.Tabs:
         elif op == "Make k-outs":
             p["mask_val"] = pw["mask_val"].value
         elif op == "Compute kins":
-            p.update(est_ttheta=pw["est_ttheta"].value, method=pw["method"].value, gtol=pw["gtol"].value)
-        elif op == "Compute kins w geometry":
-            p.update(method=pw["method"].value, gtol=pw["gtol"].value)
-        elif op == "Refine kins":
-            p.update(alpha=pw["alpha"].value, beta=pw["beta"].value, gamma=pw["gamma"].value)
+            p.update(est_ttheta=pw["est_ttheta"].value, use_intensity=pw["use_int"].value)
         elif op == "Filter coherent images":
             p["var_thresh"] = pw["var_thresh"].value
         elif op == "Remove background":
@@ -3292,11 +3266,7 @@ def _make_roi_tab(roi_name: str) -> pn.Tabs:
         elif op == "Make k-outs":
             params_col.append(pw["mask_val"])
         elif op == "Compute kins":
-            params_col.append(pn.Row(pw["est_ttheta"], pw["method"], pw["gtol"]))
-        elif op == "Compute kins w geometry":
-            params_col.append(pn.Row(pw["method"], pw["gtol"]))
-        elif op == "Refine kins":
-            params_col.append(pn.Row(pw["alpha"], pw["beta"], pw["gamma"]))
+            params_col.append(pn.Row(pw["est_ttheta"], pw["use_int"]))
         elif op == "Filter coherent images":
             params_col.append(pw["var_thresh"])
         elif op == "Remove background":
