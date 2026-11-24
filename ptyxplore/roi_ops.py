@@ -572,7 +572,7 @@ def make_parallel_streaks(roi:ROI, width= None, extent= None, mask_thr = 0):
     roi.kin_coords = [roi.kin_coords[mask] for mask in masks_clean]
     roi.kout_coords = [roi.kout_coords[mask] for mask in masks_clean]
 
-def make_qz_streaks(roi, dqz=None, extent=None, min_pixels=5):
+def make_qz_streaks(roi, dqz=None, extent=None, min_pixels=15):
     """
     Split an ROI into constant-qz streaks.
     """
